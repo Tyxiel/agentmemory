@@ -11,6 +11,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/MCP-54_tools-1f6feb?style=flat-square" alt="54 MCP tools" />
   <img src="https://img.shields.io/badge/Plugin-22_hooks-1f6feb?style=flat-square" alt="22 hooks" />
+  <img src="https://img.shields.io/badge/OpenCode-1.x_%2B_2.x-1f6feb?style=flat-square" alt="OpenCode 1.x and 2.x" />
   <img src="https://img.shields.io/badge/Commands-2_slash-1f6feb?style=flat-square" alt="2 slash commands" />
   <img src="https://img.shields.io/badge/R@5-95.2%25-00875f?style=flat-square" alt="95.2% R@5" />
 </p>
@@ -45,13 +46,23 @@ Add to `~/.config/opencode/opencode.json` or your project's `.opencode/opencode.
 
 ### 3. Install the plugin
 
-Add to `~/.config/opencode/opencode.json`:
+**OpenCode 2.x** — add to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "plugins": ["./plugins/agentmemory-capture.ts"]
+}
+```
+
+**OpenCode 1.x** — the V1 key still works:
 
 ```json
 {
   "plugin": ["./plugins/agentmemory-capture.ts"]
 }
 ```
+
+The plugin file supports both. See [OpenCode 1.x and 2.x](#opencode-1x-and-2x) below.
 
 Copy the plugin file from this repo:
 
@@ -72,6 +83,72 @@ cp plugin/opencode/commands/remember.md ~/.config/opencode/commands/
 
 Restart OpenCode or open a new session. The plugin auto-captures everything.
 
+## OpenCode 1.x and 2.x
+
+`agentmemory-capture.ts` supports both plugin APIs from a single file.
+
+OpenCode 2 replaced the V1 `Hooks`-object plugin shape: the default export must
+carry an `id` plus a `setup(ctx)`, and hooks are registered on the domain that
+owns the operation. The plugin therefore default-exports both:
+
+```ts
+export default {
+  id: "agentmemory-capture",
+  setup: v2Setup,    // OpenCode 2.x
+  server: v1Hooks,   // OpenCode 1.x (1.18.29+)
+}
+```
+
+- **OpenCode 2.x** reads `id` and `setup()` and ignores `server()`.
+- **OpenCode 1.x** calls `server()` and uses the returned hooks.
+- The two implementations are separate on purpose. Sharing an export does not
+  translate V1 hooks into V2 hooks, and the payloads differ enough that a shared
+  core would overstate V2 coverage.
+
+Tested against **OpenCode v2.0.20**. `@opencode/plugin` is not imported at
+runtime, so no V2 SDK install is required.
+
+### Hook mapping
+
+| V1 hook | V2 API | Status |
+|---|---|---|
+| `event` | `ctx.event.subscribe()` | ported |
+| `tool.execute.before` | `ctx.tool.hook("execute.before")` | ported |
+| `chat.message` | `ctx.session.hook("prompt")` | ported |
+| `experimental.chat.system.transform` | `ctx.session.hook("context")` | ported |
+| `config` | *(none)* | **V2: one-shot snapshot at setup** |
+| `chat.params` | *(none)* | **V2: not captured** |
+| `experimental.session.compacting` | `ctx.session.hook("compaction")` | **V2: not injectable** |
+
+All 15 event types the plugin consumes still exist on the V2 public event
+stream. One was renamed: `permission.updated` is now `permission.asked`, with
+the payload reshaped into a `PermissionRequest` (`permission`, `patterns`,
+`tool.callID`).
+
+`output.system` (a string array) became `event.system` (`SystemPart[]`), so
+injection pushes part objects rather than strings.
+
+### What V2 cannot do
+
+Three V1 hooks are absent from the V2 path. They were dropped rather than
+approximated, because a wrong-shaped payload reaching agentmemory is worse than
+a missing one.
+
+- **`config`** — V2 exposes no mutable global config object and no hook that
+  observes it. The V2 path takes a one-shot snapshot at `setup` from
+  `ctx.agent.list()`, `ctx.provider.list()`, `ctx.mcp.list()`, and
+  `ctx.model.default()`. Config edited while OpenCode is running is not
+  captured.
+- **`chat.params`** — V2's `context` hook starts with empty `options` rather
+  than resolved model settings, so recorded temperature / topP / token limits
+  would be wrong. `llm_params` observations are not recorded on V2.
+- **`experimental.session.compacting`** — V1 pushed recalled context into the
+  compaction prompt. V2's `compaction` hook exposes only `system`, `messages`,
+  and `options`, plus a `result` field that, when set, skips the model call
+  entirely. Memory cannot be attached to the compaction prompt, so it is not
+  re-injected when a session compacts. Memory injection still happens on every
+  non-compaction model request via the `context` hook.
+
 ## What gets captured
 
 ### Session lifecycle
@@ -89,12 +166,12 @@ Restart OpenCode or open a new session. The plugin auto-captures everything.
 
 ### Messages & prompts
 
-| Event | Hook | agentmemory API |
-|---|---|---|
-| User prompt (rich) | `chat.message` | POST /observe |
-| User prompt metadata | `message.updated` (user) | POST /observe |
-| Assistant response | `message.updated` (assistant) | POST /observe |
-| Message removed (undo) | `message.removed` | POST /observe |
+| Event | V1 hook | V2 hook | agentmemory API |
+|---|---|---|---|
+| User prompt (rich) | `chat.message` | `ctx.session.hook("prompt")` | POST /observe |
+| User prompt metadata | `message.updated` (user) | `message.updated` (user) | POST /observe |
+| Assistant response | `message.updated` (assistant) | `message.updated` (assistant) | POST /observe |
+| Message removed (undo) | `message.removed` | `message.removed` | POST /observe |
 
 ### Parts & steps
 
@@ -112,20 +189,23 @@ Restart OpenCode or open a new session. The plugin auto-captures everything.
 
 ### File enrichment pipeline
 
-| Event | Hook | agentmemory API |
-|---|---|---|
-| File tool params | `tool.execute.before` → stash paths | — |
-| File edited | `file.edited` → stash paths | — |
-| File part attached | `message.part.updated` (file) → stash paths | — |
-| Enrichment inject | `experimental.chat.system.transform` | POST /enrich → `output.system[]` |
-| Memory context inject | `experimental.chat.system.transform` | POST /context → `output.system[]` |
+| Event | V1 hook | V2 hook | agentmemory API |
+|---|---|---|---|
+| File tool params | `tool.execute.before` → stash paths | `ctx.tool.hook("execute.before")` | - |
+| File edited | `file.edited` → stash paths | `file.edited` | - |
+| File part attached | `message.part.updated` (file) → stash paths | `message.part.updated` (file) | - |
+| Enrichment inject | `experimental.chat.system.transform` | `ctx.session.hook("context")` | POST /enrich → system prompt |
+| Memory context inject | `experimental.chat.system.transform` | `ctx.session.hook("context")` | POST /context → system prompt |
+
+On V1 the two injects land in `output.system[]`. On V2 they are pushed as
+`SystemPart` objects onto `event.system`.
 
 ### Permissions
 
-| Event | Hook | agentmemory API |
-|---|---|---|
-| Permission prompt | `permission.updated` | POST /observe |
-| Permission reply | `permission.replied` | POST /observe |
+| Event | V1 hook | V2 hook | agentmemory API |
+|---|---|---|---|
+| Permission prompt | `permission.updated` | `permission.asked` | POST /observe |
+| Permission reply | `permission.replied` | `permission.replied` | POST /observe |
 
 ### Tasks & commands
 
@@ -136,11 +216,15 @@ Restart OpenCode or open a new session. The plugin auto-captures everything.
 
 ### Model & config
 
-| Event | Hook | agentmemory API |
-|---|---|---|
-| LLM parameters | `chat.params` | POST /observe |
-| Config loaded | `config` | POST /observe |
-| Compaction (WIP) | `experimental.session.compacting` | POST /context → `output.context[]` |
+| Event | V1 hook | V2 | agentmemory API |
+|---|---|---|---|
+| LLM parameters | `chat.params` | not captured | POST /observe (V1 only) |
+| Config loaded | `config` | snapshot at setup | POST /observe |
+| Compaction context | `experimental.session.compacting` | not injectable | POST /context → `output.context[]` (V1 only) |
+
+These three are the only differences between the V1 and V2 paths. Everything
+else in this document is captured identically on both. See
+[What V2 cannot do](#what-v2-cannot-do).
 
 ### File enrichment + memory injection (two-layer pipeline)
 
