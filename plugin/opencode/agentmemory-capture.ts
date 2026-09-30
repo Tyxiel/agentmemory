@@ -823,7 +823,11 @@ async function v2Setup(ctx: any) {
         model: ctx.model?.default?.() ?? null,
         location: defaultProjectCwd,
       };
+      // `setup` runs before any session.created, so `activeSessionId` is
+      // normally null here. Park the payload and let the session.created
+      // handler flush it, the same way V1's `config` hook does.
       if (activeSessionId) await observeV2(activeSessionId, "config_loaded", payload);
+      else pendingConfig = payload;
     } catch (e) {
       if (DEBUG) console.error("[agentmemory] config snapshot failed:", (e as Error).message);
     }
@@ -918,10 +922,13 @@ async function v2Setup(ctx: any) {
 
   const controller = new AbortController();
 
-  void (async () => {
-    try {
-      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-        const type = event.type;
+  // The switch below is wrapped in a function so its `return` statements only
+  // skip the current event. Inline in the loop, they would exit the IIFE and
+  // permanently end the subscription. This mirrors V1, where `return` exits
+  // only the current event callback.
+  const handleEvent = async (event: any): Promise<void> => {
+    {
+      const type = event.type;
         const props: any = (event as any).properties || {};
         const sid0 = props.sessionID || (props.info?.id as string) || activeSessionId;
 
@@ -952,6 +959,12 @@ async function v2Setup(ctx: any) {
             });
             const startCtx = startResult?.context;
             if (typeof startCtx === "string" && startCtx.length > 0) startContextCache.set(sessionId, startCtx);
+            // Flush the setup-time config snapshot parked before any session
+            // existed. Sent after /session/start so the session is registered.
+            if (pendingConfig) {
+              await observeV2(sessionId, "config_loaded", pendingConfig);
+              pendingConfig = null;
+            }
             break;
           }
 
@@ -1093,14 +1106,17 @@ async function v2Setup(ctx: any) {
                 if (!state) return;
                 const callId = part.callID;
                 if (!callId) return;
-                const set = toolCallSetFor(sid);
-                if (set.has(callId)) return;
-                set.add(callId);
                 const start = typeof state.time?.start === "number" ? state.time.start : null;
                 const end = typeof state.time?.end === "number" ? state.time.end : null;
                 const duration = start != null && end != null ? end - start : null;
 
+                // Dedup on terminal states only, matching V1. Marking the ID on
+                // the first pending/running update would make the completed
+                // update look like a duplicate and drop the observation.
                 if (state.status === "completed") {
+                  const set = toolCallSetFor(sid);
+                  if (set.has(callId)) return;
+                  set.add(callId);
                   await observeV2(sid, "post_tool_use", {
                     tool_name: part.tool,
                     call_id: callId,
@@ -1114,6 +1130,9 @@ async function v2Setup(ctx: any) {
                       : [],
                   });
                 } else if (state.status === "error") {
+                  const set = toolCallSetFor(sid);
+                  if (set.has(callId)) return;
+                  set.add(callId);
                   await observeV2(sid, "post_tool_failure", {
                     tool_name: part.tool,
                     call_id: callId,
@@ -1242,6 +1261,18 @@ async function v2Setup(ctx: any) {
             }
             break;
           }
+        }
+    }
+  };
+
+  void (async () => {
+    try {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        // A throw from one event must not end the subscription.
+        try {
+          await handleEvent(event);
+        } catch (e) {
+          if (DEBUG) console.error("[agentmemory] event handler failed:", (e as Error).message);
         }
       }
     } catch (e) {
