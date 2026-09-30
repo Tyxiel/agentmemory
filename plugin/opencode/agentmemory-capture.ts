@@ -894,7 +894,7 @@ async function v2Setup(ctx: any) {
       let ctxText = startContextCache.get(sid);
       if (typeof ctxText !== "string" || ctxText.length === 0) {
         const result = await postJson("/context", { sessionId: sid, project: projectFor(sid).name });
-        ctxText = result?.context;
+        ctxText = (result as any)?.context;
       } else {
         startContextCache.delete(sid);
       }
@@ -909,7 +909,7 @@ async function v2Setup(ctx: any) {
     const files = [...stash].slice(0, 10);
 
     const enrichResult = await postJson("/enrich", { sessionId: sid, files, toolName: "enrich_inject" });
-    const enrichCtx = enrichResult?.context;
+    const enrichCtx = (enrichResult as any)?.context;
     if (typeof enrichCtx === "string" && enrichCtx.length > 0) {
       if (Array.isArray(event.system)) event.system.push({ type: "text", text: enrichCtx });
       for (const f of files) stash.delete(f);
@@ -957,7 +957,7 @@ async function v2Setup(ctx: any) {
               project: proj.name,
               cwd: proj.cwd,
             });
-            const startCtx = startResult?.context;
+            const startCtx = (startResult as any)?.context;
             if (typeof startCtx === "string" && startCtx.length > 0) startContextCache.set(sessionId, startCtx);
             // Flush the setup-time config snapshot parked before any session
             // existed. Sent after /session/start so the session is registered.
