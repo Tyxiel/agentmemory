@@ -62,10 +62,31 @@ Write-Host ""
 Write-Host "DIVERGENTE: o instalado NAO corresponde ao repositorio." -ForegroundColor Yellow
 
 # O blocker do V2: ler event.properties em vez de event.data.
+#
+# Restrito ao bloco V2 quando ele existe, porque o caminho V1 le
+# event.properties legitimamente: no V1 o payload vem em properties. Checar o
+# arquivo inteiro acusava um arquivo saudavel de estar quebrado.
+#
+# Se nao houver `v2Setup`, o arquivo e de um formato V2-only antigo (antes do
+# dual export) e o caminho V2 e o arquivo inteiro.
 if ($dstHash) {
-  $readsProperties = Select-String -Path $Installed -Pattern '\(event as any\)\.properties' -Quiet
-  if ($readsProperties) {
-    Write-Host "  O instalado ainda le event.properties, o blocker do V2. Captura morta." -ForegroundColor Red
+  $src = [System.IO.File]::ReadAllText($Installed)
+  $v2Start = $src.IndexOf("async function v2Setup")
+  if ($v2Start -ge 0) {
+    $scope = $src.Substring($v2Start)
+    $scopeLabel = "caminho V2"
+  } else {
+    $scope = $src
+    $scopeLabel = "arquivo (formato V2-only)"
+  }
+  # No caminho V2, `properties` nao deve aparecer em codigo de forma alguma:
+  # o payload vem em `data`. Comentarios sao ignorados porque o proprio
+  # arquivo documenta o erro.
+  $hits = ($scope -split "`r?`n") | Where-Object {
+    $_ -match '\bproperties\b' -and $_ -notmatch '^\s*(//|\*|/\*)'
+  }
+  if ($hits) {
+    Write-Host "  O $scopeLabel ainda le 'properties' em codigo. No V2 o payload vem em 'data'; captura morta." -ForegroundColor Red
   }
   $lines = ([System.IO.File]::ReadAllLines($Installed)).Length
   $srcLines = ([System.IO.File]::ReadAllLines($source)).Length
