@@ -105,49 +105,97 @@ export default {
   translate V1 hooks into V2 hooks, and the payloads differ enough that a shared
   core would overstate V2 coverage.
 
-Tested against **OpenCode v2.0.20**. `@opencode/plugin` is not imported at
-runtime, so no V2 SDK install is required.
+Validated against **OpenCode v2.0.22** by running the plugin inside a live
+session and logging the objects as they arrive, not by reading the generated
+SDK types. That distinction matters: `@opencode-ai/sdk` 1.4.10 declares
+`event.properties` and the V1 event names, and it is stale relative to the
+runtime. Where this README says a payload was observed, it was read off a
+running server.
+
+### What the V2 runtime actually does
+
+- **The payload is in `event.data`, not `event.properties`.** The envelope is
+  `created, data, id, location, type`. Reading `properties` yields `{}`.
+- **The V1 event names are gone.** They were not renamed one-for-one; the
+  stream is organised differently. `location` on the envelope is
+  process-level, so session identity comes from `data.sessionID`.
+- **`list()` returns `{ data, location }`.** `ctx.agent.list()`,
+  `ctx.provider.list()` and `ctx.mcp.list()` all resolve to that shape.
+- **`ctx.model.default()` is a promise.** Unawaited it is `{}`.
+- **There is no `session.created`.** A session is registered by the first event
+  carrying its ID. `session.execution.started` was not observed on the live
+  stream, so `session_started` is emitted at registration rather than waiting
+  for an event that may never arrive.
 
 ### Hook mapping
 
-| V1 hook | V2 API | Status |
+| V1 | V2 | Status |
 |---|---|---|
 | `event` | `ctx.event.subscribe()` | ported |
 | `tool.execute.before` | `ctx.tool.hook("execute.before")` | ported |
+| tool results (`message.part.updated`) | `ctx.tool.hook("execute.after")` | ported |
 | `chat.message` | `ctx.session.hook("prompt")` | ported |
 | `experimental.chat.system.transform` | `ctx.session.hook("context")` | ported |
-| `config` | *(none)* | **V2: one-shot snapshot at setup** |
-| `chat.params` | *(none)* | **V2: not captured** |
-| `experimental.session.compacting` | `ctx.session.hook("compaction")` | **V2: not injectable** |
-
-All 15 event types the plugin consumes still exist on the V2 public event
-stream. One was renamed: `permission.updated` is now `permission.asked`, with
-the payload reshaped into a `PermissionRequest` (`permission`, `patterns`,
-`tool.callID`).
+| `experimental.session.compacting` | `ctx.session.hook("compaction")` | ported, inferred |
+| `config` | *(no hook)* | snapshot at `setup`, refreshed on `*.updated` |
+| `chat.params` | *(no equivalent)* | not captured |
 
 `output.system` (a string array) became `event.system` (`SystemPart[]`), so
 injection pushes part objects rather than strings.
 
+### Event mapping
+
+| V1 event | V2 |
+|---|---|
+| `session.created` | first event carrying `data.sessionID` |
+| `session.deleted` | `session.deleted` |
+| `session.status`, `session.idle` | `session.step.started` / `session.step.ended` |
+| `message.updated` | `session.text.*`, `session.reasoning.*` |
+| `message.part.updated` | `ctx.tool.hook("execute.after")` |
+| `command.executed` | `shell.created` (result from `shell.exited`) |
+| `session.error` | `session.execution.failed` |
+| `file.edited` | `file.watcher.updated` |
+| `session.compacted` | `ctx.session.hook("compaction")` |
+| `permission.updated` | `permission.asked` (payload is a `PermissionRequest`) |
+| `todo.updated`, `session.diff` | *no V2 equivalent observed* |
+
+`permission.asked` and `permission.replied` were not seen firing during
+development. They are handled against the documented shape, reading both the
+V2 field names and the V1 fallbacks, and are not covered by the observed
+columns in the table below.
+
+### Injection happens on every call
+
+`ctx.session.hook("context")` fires on every model call, so recalled memory is
+injected every time. The previous implementation injected once per session,
+which meant only the first prompt of a session carried memory. The
+`compaction` hook exposes `system` as well and is wired to `/context` for the
+same reason.
+
 ### What V2 cannot do
 
-Three V1 hooks are absent from the V2 path. They were dropped rather than
-approximated, because a wrong-shaped payload reaching agentmemory is worse than
-a missing one.
+- **`chat.params`** — V2's `context` hook exposes `options` with `maxTokens`
+  only; temperature and `topP` are absent, and `model` carries only
+  `id` / `providerID` / `variant`. Recorded `llm_params` would be wrong rather
+  than partial, so they are not recorded. The `model` on the hook is captured
+  in `step_start` instead, where it is real.
 
-- **`config`** — V2 exposes no mutable global config object and no hook that
-  observes it. The V2 path takes a one-shot snapshot at `setup` from
-  `ctx.agent.list()`, `ctx.provider.list()`, `ctx.mcp.list()`, and
-  `ctx.model.default()`. Config edited while OpenCode is running is not
-  captured.
-- **`chat.params`** — V2's `context` hook starts with empty `options` rather
-  than resolved model settings, so recorded temperature / topP / token limits
-  would be wrong. `llm_params` observations are not recorded on V2.
-- **`experimental.session.compacting`** — V1 pushed recalled context into the
-  compaction prompt. V2's `compaction` hook exposes only `system`, `messages`,
-  and `options`, plus a `result` field that, when set, skips the model call
-  entirely. Memory cannot be attached to the compaction prompt, so it is not
-  re-injected when a session compacts. Memory injection still happens on every
-  non-compaction model request via the `context` hook.
+### Verification
+
+- A 36-assertion suite drives the V2 path with payloads captured from
+  v2.0.22 and covers every handler, the deduplication paths between
+  `execute.after`, `session.tool.failed` and `shell.exited`, and the regression
+  where an early `return` ended the event subscription permanently. Zero
+  failures.
+- In a live session the plugin produced real observations for
+  `post_tool_use`, `config_loaded`, `step_start`, `step_finish`,
+  `assistant_message`, `command_executed`, `reasoning`, `text_started`,
+  `text_ended` and `notification`.
+
+Earlier in this branch the V2 path loaded cleanly and captured almost nothing,
+because it was verified against a hand-built context object that agreed with
+its own assumptions. Verifying that the plugin loads is not verifying that it
+works.
 
 ## What gets captured
 
