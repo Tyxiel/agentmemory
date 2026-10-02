@@ -133,10 +133,26 @@ running server.
 - **`list()` returns `{ data, location }`.** `ctx.agent.list()`,
   `ctx.provider.list()` and `ctx.mcp.list()` all resolve to that shape.
 - **`ctx.model.default()` is a promise.** Unawaited it is `{}`.
-- **There is no `session.created`.** A session is registered by the first event
-  carrying its ID. `session.execution.started` was not observed on the live
-  stream, so `session_started` is emitted at registration rather than waiting
-  for an event that may never arrive.
+- **`session.created` exists.** It carries `sessionID`, `projectID`,
+  `location`, `title`, `version`, `subpath` and `slug`, so a session normally
+  registers on creation with its title and directory in hand. The fallback to
+  "first event carrying an ID" remains for sessions that predate the plugin
+  load, which never emit the event. An earlier revision of this plugin claimed
+  `session.created` did not exist; that came from observing an already-open
+  session and never creating one, which is absence in a sample rather than
+  absence in the API.
+- **`ctx.session.hook("compaction")` registers a handler that is never
+  invoked.** Confirmed by calling `ctx.session.compact()` directly and watching
+  the callback stay silent while a compaction message was returned. Compaction
+  is captured from `session.compaction.started` and
+  `session.compaction.failed` instead. A registered hook is not evidence that
+  it fires: the loader validates hook names at registration only.
+- **`session.execution.succeeded` is observed but not recorded.** It carries
+  only `{ sessionID }`, which every other observation in the session already
+  carries, and `session.step.ended` covers the meaningful signal.
+- **`parentID` is accepted by `ctx.session.create` but appears in no event
+  payload.** The `parentID` sent to `/session/start` is therefore always null;
+  the field is kept in case a future version populates it.
 
 ### Hook mapping
 
@@ -147,7 +163,7 @@ running server.
 | tool results (`message.part.updated`) | `ctx.tool.hook("execute.after")` | ported |
 | `chat.message` | `ctx.session.hook("prompt")` | ported |
 | `experimental.chat.system.transform` | `ctx.session.hook("context")` | ported |
-| `experimental.session.compacting` | `ctx.session.hook("compaction")` | ported, inferred |
+| `experimental.session.compacting` | *(no working hook)* | **V2: observed via events, not injectable** |
 | `config` | *(no hook)* | snapshot at `setup`, refreshed on `*.updated` |
 | `chat.params` | *(no equivalent)* | not captured |
 
@@ -158,7 +174,7 @@ injection pushes part objects rather than strings.
 
 | V1 event | V2 |
 |---|---|
-| `session.created` | first event carrying `data.sessionID` |
+| `session.created` | `session.created` (or first event carrying `data.sessionID`) |
 | `session.deleted` | `session.deleted` |
 | `session.status`, `session.idle` | `session.step.started` / `session.step.ended` |
 | `message.updated` | `session.text.*`, `session.reasoning.*` |
@@ -166,7 +182,7 @@ injection pushes part objects rather than strings.
 | `command.executed` | `shell.created` (result from `shell.exited`) |
 | `session.error` | `session.execution.failed` |
 | `file.edited` | `file.watcher.updated` |
-| `session.compacted` | `ctx.session.hook("compaction")` |
+| `session.compacted` | `session.compaction.started` / `.failed` |
 | `permission.updated` | `permission.asked` (payload is a `PermissionRequest`) |
 | `todo.updated`, `session.diff` | *no V2 equivalent observed* |
 
@@ -181,10 +197,12 @@ columns in the table below.
 injected every time. The previous implementation injected once per session,
 which meant only the first prompt of a session carried memory.
 
-The `compaction` hook is wired to `/context` the same way, but that path is
-**inferred and unobserved**: the handler registers without error, yet it has
-never been seen to fire. Its shape is taken from the sibling `context` hook, so
-treat compaction injection as untested until a session is observed compacting.
+The `compaction` hook is **not** wired, because it does not work: it registers
+without error and never invokes, confirmed by forcing a compaction in a running
+v2.0.22. Compaction is observed through
+`session.compaction.started` and `session.compaction.failed` instead. Recalled
+memory still cannot be attached to the compaction prompt, since no compaction
+event exposes a `system` array to inject into.
 
 ### What V2 cannot do
 
@@ -226,20 +244,30 @@ these three risks retired with it.
 
 ### Verification
 
-- A 42-assertion suite drives the V2 path with payloads captured from
-  v2.0.22 and covers every handler, the deduplication paths between
-  `execute.after`, `session.tool.failed` and `shell.exited`, and the regression
-  where an early `return` ended the event subscription permanently. Zero
-  failures.
+- `test/opencode-plugin-v2.test.ts` — 33 cases driving the V2 path with payloads
+  captured from v2.0.22. It runs under the repo's existing vitest, so:
+
+  ```bash
+  npx vitest run test/opencode-plugin-v2.test.ts
+  ```
+
+  It covers session lifecycle, the tool hooks, memory injection on every model
+  call, compaction, the event switch, and the regression where an early
+  `return` ended the event subscription. Each case added with the compaction
+  change was checked against the previous commit: the three compaction cases
+  fail on it and pass here.
 - In a live session the plugin produced real observations for
   `post_tool_use`, `config_loaded`, `step_start`, `step_finish`,
   `assistant_message`, `command_executed`, `reasoning`, `text_started`,
-  `text_ended` and `notification`.
+  `text_ended` and `notification`. `session.compaction.started` and
+  `session.compaction.failed` were confirmed by forcing a compaction in a
+  running v2.0.22.
 
 Earlier in this branch the V2 path loaded cleanly and captured almost nothing,
 because it was verified against a hand-built context object that agreed with
 its own assumptions. Verifying that the plugin loads is not verifying that it
-works.
+works, and the suite exists so that the next person does not have to learn that
+twice.
 
 ## What gets captured
 
@@ -312,7 +340,7 @@ On V1 the two injects land in `output.system[]`. On V2 they are pushed as
 |---|---|---|---|
 | LLM parameters | `chat.params` | not captured | POST /observe (V1 only) |
 | Config loaded | `config` | snapshot at setup | POST /observe |
-| Compaction context | `experimental.session.compacting` | inferred, unobserved | POST /context → `event.system[]` |
+| Compaction context | *(no working V2 hook)* | not injectable | observed via `session.compaction.*` |
 
 These three are the only differences between the V1 and V2 paths. Everything
 else in this document is captured identically on both. See
