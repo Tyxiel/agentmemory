@@ -46,45 +46,41 @@ Add to `~/.config/opencode/opencode.json` or your project's `.opencode/opencode.
 
 ### 3. Install the plugin
 
-Copy the plugin file once:
+Copy the plugin file:
 
 ```bash
 mkdir -p ~/.config/opencode/plugins
 cp plugin/opencode/agentmemory-capture.ts ~/.config/opencode/plugins/
 ```
 
-Then register it. **Pick one of the two routes below, not both.**
+That is the whole install. OpenCode loads every plugin file in
+`~/.config/opencode/plugins/` automatically, so there is nothing to register.
 
-**Route A — the config key.** Add to `~/.config/opencode/opencode.json`:
+> **Do not also add it to `opencode.json`.** Listing the file under
+> `"plugins"` on top of leaving it in the auto-loaded directory registers the
+> same plugin twice, and it then captures every event twice. If you see doubled
+> observations, remove the `"plugins"` entry and keep the file where it is.
+>
+> If you would rather keep plugins outside that directory, install the file
+> somewhere else and point the config key at it:
+>
+> ```json
+> {
+>   "plugins": ["./my-plugins/agentmemory-capture.ts"]
+> }
+> ```
+>
+> Either location works. The two must not both be in effect at once.
 
-```json
-{
-  "plugins": ["./plugins/agentmemory-capture.ts"]
-}
-```
-
-Use this if the file lives outside the plugins directory, or if you want an
-explicit entry you can comment out.
-
-**Route B — the auto-loaded directory.** Nothing to add. OpenCode loads every
-plugin file in `~/.config/opencode/plugins/` automatically, so the `cp` above is
-the whole install.
-
-> **Do not combine them.** Listing the file in `"plugins"` *and* leaving it in
-> `~/.config/opencode/plugins/` can register the same plugin twice, and the
-> plugin will then capture every event twice. If you see doubled observations,
-> this is the cause: remove the `"plugins"` entry and keep the file in place.
-
-**OpenCode 1.x** — the V1 key still works, same caution about combining routes:
+**OpenCode 1.x** — the same file works, using the V1 key instead:
 
 ```json
 {
-  "plugin": ["./plugins/agentmemory-capture.ts"]
+  "plugin": ["./my-plugins/agentmemory-capture.ts"]
 }
 ```
 
-The plugin file itself supports both APIs. See
-[OpenCode 1.x and 2.x](#opencode-1x-and-2x) below.
+See [OpenCode 1.x and 2.x](#opencode-1x-and-2x) below.
 
 ### 4. Add the slash commands
 
@@ -183,9 +179,12 @@ columns in the table below.
 
 `ctx.session.hook("context")` fires on every model call, so recalled memory is
 injected every time. The previous implementation injected once per session,
-which meant only the first prompt of a session carried memory. The
-`compaction` hook exposes `system` as well and is wired to `/context` for the
-same reason.
+which meant only the first prompt of a session carried memory.
+
+The `compaction` hook is wired to `/context` the same way, but that path is
+**inferred and unobserved**: the handler registers without error, yet it has
+never been seen to fire. Its shape is taken from the sibling `context` hook, so
+treat compaction injection as untested until a session is observed compacting.
 
 ### What V2 cannot do
 
@@ -227,7 +226,7 @@ these three risks retired with it.
 
 ### Verification
 
-- A 35-assertion suite drives the V2 path with payloads captured from
+- A 40-assertion suite drives the V2 path with payloads captured from
   v2.0.22 and covers every handler, the deduplication paths between
   `execute.after`, `session.tool.failed` and `shell.exited`, and the regression
   where an early `return` ended the event subscription permanently. Zero
@@ -313,7 +312,7 @@ On V1 the two injects land in `output.system[]`. On V2 they are pushed as
 |---|---|---|---|
 | LLM parameters | `chat.params` | not captured | POST /observe (V1 only) |
 | Config loaded | `config` | snapshot at setup | POST /observe |
-| Compaction context | `experimental.session.compacting` | not injectable | POST /context → `output.context[]` (V1 only) |
+| Compaction context | `experimental.session.compacting` | inferred, unobserved | POST /context → `event.system[]` |
 
 These three are the only differences between the V1 and V2 paths. Everything
 else in this document is captured identically on both. See

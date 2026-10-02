@@ -847,12 +847,29 @@ async function v2Setup(ctx: any) {
   // Shell ids mapped to their session, so `shell.exited` (which carries no
   // sessionID) can attribute an exit code back to the right session.
   const shellSessions = new Map<string, string>();
+
+  // Every stash write goes through here so the cap is enforced in one place.
+  // The file watcher and filesystem handlers fire for any workspace change, so
+  // an untrimmed write there lets the stash grow without bound.
+  function stashAdd(sid: string, paths: Iterable<string>): void {
+    const stash = stashFor(sid);
+    for (const p of paths) stash.add(p);
+    if (stash.size > MAX_STASHED_FILES) {
+      const keep = [...stash].slice(-MAX_STASHED_FILES);
+      stash.clear();
+      for (const k of keep) stash.add(k);
+    }
+  }
+
   // Tool name per call ID: V2 puts it on the *input* events, not the call.
   const toolNames = new Map<string, string>();
   const toolCallInputs = new Map<string, Record<string, unknown>>();
   // `session:callId` pairs already reported by `execute.after`, so the
   // `session.tool.failed` event stays a fallback rather than a duplicate.
   const reportedToolCalls = new Set<string>();
+  // Sessions that have been sent to `/session/start`, so registration happens
+  // once per session rather than once per process.
+  const registeredSessions = new Set<string>();
 
   // `list()` resolves to `{ data, location }`. Older/alternate shapes return the
   // array directly, so both are accepted rather than assuming either.
@@ -905,13 +922,7 @@ async function v2Setup(ctx: any) {
     if (!sid) return;
     const args = event?.input as Record<string, unknown> | undefined;
     if (!args) return;
-    const stash = stashFor(sid);
-    for (const fp of extractFilePaths(args)) stash.add(fp);
-    if (stash.size > MAX_STASHED_FILES) {
-      const keep = [...stash].slice(-MAX_STASHED_FILES);
-      stash.clear();
-      for (const k of keep) stash.add(k);
-    }
+    stashAdd(sid, extractFilePaths(args));
   });
 
   // ── tool results -> ctx.tool.hook("execute.after") ────────────────────────
@@ -947,9 +958,6 @@ async function v2Setup(ctx: any) {
         tool_output: safeSlice(text || extractErrorMessage(metadata?.error), 8000),
         duration_ms: duration,
       });
-      // Mark the call as covered so the `session.tool.failed` event does not
-      // report the same failure a second time.
-      if (callId) reportedToolCalls.add(`${sid}:${callId}`);
       // Mark the call as covered so `session.tool.failed`, which fires for the
       // same call, does not report the failure a second time.
       if (callId) reportedToolCalls.add(`${sid}:${callId}`);
@@ -969,7 +977,6 @@ async function v2Setup(ctx: any) {
         : [],
     });
     if (callId) reportedToolCalls.add(`${sid}:${callId}`);
-  if (callId) reportedToolCalls.add(`${sid}:${callId}`);
   });
 
   // ── chat.message -> ctx.session.hook("prompt") ───────────────────────────
@@ -980,13 +987,7 @@ async function v2Setup(ctx: any) {
     const files = (event?.prompt?.files ?? [])
       .map((f: any) => (typeof f === "string" ? f : f?.uri ?? f?.filename ?? f?.url))
       .filter(Boolean) as string[];
-    const stash = stashFor(sid);
-    for (const f of files) stash.add(f);
-    if (stash.size > MAX_STASHED_FILES) {
-      const keep = [...stash].slice(-MAX_STASHED_FILES);
-      stash.clear();
-      for (const k of keep) stash.add(k);
-    }
+    stashAdd(sid, files);
     await observeV2(sid, "prompt_submit", {
       prompt: (event?.prompt?.text ?? "").slice(0, 8000),
       files: files.slice(0, 20),
@@ -1073,12 +1074,21 @@ async function v2Setup(ctx: any) {
     const type = String(event?.type ?? "");
     // V2 puts the payload in `data`, not `properties`.
     const data: any = event?.data ?? {};
-    const sid0 = (data.sessionID as string) || activeSessionId;
+    const eventSid = typeof data.sessionID === "string" && data.sessionID ? data.sessionID : null;
+    const sid0 = eventSid || activeSessionId;
 
-    // A session that appears on any event is registered once, so
-    // /session/start, the config flush and per-session state all happen.
-    if (sid0 && !activeSessionId) {
-      activeSessionId = sid0;
+    // A session that appears on any event is registered once, so /session/start,
+    // the config flush and per-session state all happen.
+    //
+    // Registration is tracked per session ID rather than gated on
+    // `activeSessionId` being unset. Gating on the global meant the first
+    // session claimed it and every later one, including a subagent child
+    // session running alongside its parent, skipped this block entirely: no
+    // `/session/start`, no `session_started`, and no per-session state, while
+    // the switch below still emitted observations for that unregistered ID.
+    if (eventSid && !registeredSessions.has(eventSid)) {
+      registeredSessions.add(eventSid);
+      if (!activeSessionId) activeSessionId = eventSid;
       stashedFiles.set(sid0, new Set());
       seenSubtaskIds.delete(sid0);
       seenToolCallIds.delete(sid0);
@@ -1276,7 +1286,7 @@ async function v2Setup(ctx: any) {
         const sid = sid0 || activeSessionId;
         if (!sid) return;
         const file = (data.file as string) ?? (data.path as string) ?? null;
-        if (file) stashFor(sid).add(file);
+        if (file) stashAdd(sid, [file]);
         return;
       }
 
@@ -1323,8 +1333,19 @@ async function v2Setup(ctx: any) {
         if (!callId || !FILE_TOOLS.has((toolNames.get(callId) ?? "").toLowerCase())) return;
         const input = toolCallInputs.get(callId);
         if (!input) return;
-        const stash = stashFor(sid0);
-        for (const fp of extractFilePaths(input)) stash.add(fp);
+        stashAdd(sid0, extractFilePaths(input));
+        return;
+      }
+
+      // The result is known here, so the per-call bookkeeping is released.
+      // Without this, every successful call kept its name, its input (which for
+      // `write` and `edit` is the whole file body) and its dedupe key for the
+      // lifetime of the process.
+      case "session.tool.success": {
+        const callId = String(data.id ?? "");
+        toolNames.delete(callId);
+        toolCallInputs.delete(callId);
+        if (sid0) reportedToolCalls.delete(`${sid0}:${callId}`);
         return;
       }
 
@@ -1382,9 +1403,14 @@ async function v2Setup(ctx: any) {
         void post("/crystals/auto", { olderThanDays: 7 }, 30000);
         void post("/consolidate-pipeline", { tier: "all", force: true }, 30000);
         if (sid === activeSessionId) activeSessionId = null;
+        registeredSessions.delete(sid);
         pruneSessionMaps(sid);
         startContextCache.delete(sid);
         contextInjectedSessions.delete(sid);
+        // Drop this session's dedupe keys so they do not accumulate.
+        for (const key of reportedToolCalls) {
+          if (key.startsWith(`${sid}:`)) reportedToolCalls.delete(key);
+        }
         return;
       }
 
