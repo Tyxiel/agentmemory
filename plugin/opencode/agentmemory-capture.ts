@@ -823,6 +823,16 @@ const v1Hooks: Plugin = async (ctx) => {
 // envelope is process-level, not per session.
 // ═══════════════════════════════════════════════════════════════════════════
 
+// `ctx` is `any` on purpose. Typing it from `@opencode/plugin` would import
+// generated types that are stale for V2: SDK 1.4.10 declares `event.properties`
+// and the V1 event names, neither of which v2.0.22 emits. That would reject
+// correct code while accepting the shape that broke the previous port.
+//
+// The cost is real and is documented in README.md: the compiler cannot catch
+// V2 payload drift, cannot confirm the event names below are real, and cannot
+// confirm `ctx.session.hook(...)` accepts a given name, since the loader takes
+// any string. Correctness rests on runtime verification instead. Retighten this
+// signature when the package ships accurate V2 types.
 async function v2Setup(ctx: any) {
   const location = ctx.location;
   defaultProjectCwd = location?.directory ?? location?.project?.directory ?? process.cwd();

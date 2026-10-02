@@ -46,7 +46,16 @@ Add to `~/.config/opencode/opencode.json` or your project's `.opencode/opencode.
 
 ### 3. Install the plugin
 
-**OpenCode 2.x** — add to `~/.config/opencode/opencode.json`:
+Copy the plugin file once:
+
+```bash
+mkdir -p ~/.config/opencode/plugins
+cp plugin/opencode/agentmemory-capture.ts ~/.config/opencode/plugins/
+```
+
+Then register it. **Pick one of the two routes below, not both.**
+
+**Route A — the config key.** Add to `~/.config/opencode/opencode.json`:
 
 ```json
 {
@@ -54,7 +63,19 @@ Add to `~/.config/opencode/opencode.json` or your project's `.opencode/opencode.
 }
 ```
 
-**OpenCode 1.x** — the V1 key still works:
+Use this if the file lives outside the plugins directory, or if you want an
+explicit entry you can comment out.
+
+**Route B — the auto-loaded directory.** Nothing to add. OpenCode loads every
+plugin file in `~/.config/opencode/plugins/` automatically, so the `cp` above is
+the whole install.
+
+> **Do not combine them.** Listing the file in `"plugins"` *and* leaving it in
+> `~/.config/opencode/plugins/` can register the same plugin twice, and the
+> plugin will then capture every event twice. If you see doubled observations,
+> this is the cause: remove the `"plugins"` entry and keep the file in place.
+
+**OpenCode 1.x** — the V1 key still works, same caution about combining routes:
 
 ```json
 {
@@ -62,14 +83,8 @@ Add to `~/.config/opencode/opencode.json` or your project's `.opencode/opencode.
 }
 ```
 
-The plugin file supports both. See [OpenCode 1.x and 2.x](#opencode-1x-and-2x) below.
-
-Copy the plugin file from this repo:
-
-```bash
-mkdir -p ~/.config/opencode/plugins
-cp plugin/opencode/agentmemory-capture.ts ~/.config/opencode/plugins/
-```
+The plugin file itself supports both APIs. See
+[OpenCode 1.x and 2.x](#opencode-1x-and-2x) below.
 
 ### 4. Add the slash commands
 
@@ -179,6 +194,36 @@ same reason.
   `id` / `providerID` / `variant`. Recorded `llm_params` would be wrong rather
   than partial, so they are not recorded. The `model` on the hook is captured
   in `step_start` instead, where it is real.
+
+### Why `ctx` is typed `any`
+
+The V2 setup signature is `async function v2Setup(ctx: any)`. That is
+deliberate, and worth explaining because it looks like a shortcut.
+
+Typing it properly would mean importing types from `@opencode-ai/plugin`. The
+generated types shipped for that package are **stale for V2**: SDK 1.4.10
+declares `EventSessionCreated = { type, properties: { sessionID, info } }` and
+enumerates the V1 event names, none of which the v2.0.22 runtime emits. A
+type-only import would therefore make the compiler reject correct code while
+accepting the shape that caused the original bug. Silence was the safer of the
+two failure modes, so `any` is used and the correctness burden moved to runtime
+verification.
+
+The known cost, stated plainly:
+
+- The compiler will not catch V2 payload drift. A renamed field becomes a
+  `undefined` at runtime instead of a type error.
+- Nothing checks that the event names in `handleEvent` are real. This branch
+  shipped a handler for fifteen V1 event names, none of which fire.
+- There is no compile-time guarantee that `ctx.session.hook(...)` takes a name
+  that exists. The loader accepts any string, so a typo registers nothing and
+  fails silently.
+
+That is why the verification suite drives the plugin with payloads captured
+from a live server instead of hand-built objects, and why the
+[Verification](#verification) section distinguishes observed from inferred. If a
+future release ships correct V2 types, this signature should be tightened and
+these three risks retired with it.
 
 ### Verification
 
