@@ -1087,7 +1087,6 @@ async function v2Setup(ctx: any) {
     // `/session/start`, no `session_started`, and no per-session state, while
     // the switch below still emitted observations for that unregistered ID.
     if (eventSid && !registeredSessions.has(eventSid)) {
-      registeredSessions.add(eventSid);
       if (!activeSessionId) activeSessionId = eventSid;
       stashedFiles.set(sid0, new Set());
       seenSubtaskIds.delete(sid0);
@@ -1105,6 +1104,25 @@ async function v2Setup(ctx: any) {
         project: proj.name,
         cwd: proj.cwd,
       });
+
+      // Only mark the session registered once `/session/start` actually
+      // returned. `postJson` yields `null` on any failure, and marking it before
+      // the response would make the session permanently ineligible for
+      // registration, so a start that failed while agentmemory was restarting
+      // would never be retried for the rest of the process.
+      if (startResult === null) {
+        // Drop the per-session state this attempt created so a retry starts
+        // clean, and leave `eventSid` out of the set.
+        stashedFiles.delete(sid0);
+        contextInjectedSessions.delete(sid0);
+        if (activeSessionId === eventSid) activeSessionId = null;
+        if (DEBUG) {
+          console.error("[agentmemory] /session/start failed, will retry on the next event for", eventSid);
+        }
+        return;
+      }
+      registeredSessions.add(eventSid);
+
       const startCtx = (startResult as any)?.context;
       if (typeof startCtx === "string" && startCtx.length > 0) startContextCache.set(sid0, startCtx);
       // V2 has no `session.created` event and `session.execution.started` was
