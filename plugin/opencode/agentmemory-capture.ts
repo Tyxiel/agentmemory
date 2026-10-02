@@ -789,6 +789,40 @@ const v1Hooks: Plugin = async (ctx) => {
 //                                   memory cannot be added to the prompt.
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════════
+// V2 implementation
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Every shape below was captured from OpenCode v2.0.22 at runtime, by a probe
+// plugin logging the objects as they arrived. The generated types in
+// `@opencode-ai/sdk` 1.4.10 are stale for V2 and were the original source of
+// the bug: they declare `event.properties` and list the V1 event names.
+//
+// What the runtime actually does:
+//
+//   * Events carry their payload in `event.data`, not `event.properties`.
+//     Top-level keys are `created, data, id, location, type` (plus `durable`).
+//   * The V1 event names are gone. The live stream carries `session.tool.*`,
+//     `session.step.*`, `session.text.*`, `session.reasoning.*`,
+//     `session.execution.*`, `session.inbox.*`, `session.instructions.*`,
+//     `session.agent.selected`, `session.usage.updated`, `shell.*` and the
+//     `*.updated` config/content events.
+//   * `ctx.agent.list()`, `ctx.provider.list()` and `ctx.mcp.list()` resolve
+//     to `{ data, location }`, so the list must be read from `.data`.
+//   * `ctx.model.default()` is a promise; without `await` it is `{}`.
+//   * `ctx.tool.hook("execute.after")` is the faithful replacement for the V1
+//     tool-result capture, and exposes `status` plus `result.output`.
+//   * `ctx.session.hook("context")` fires on every model call and exposes
+//     `system` as `SystemPart[]`, so memory is injected on every call rather
+//     than once per session.
+//   * `ctx.session.hook("compaction")` accepts a handler. Its shape is inferred
+//     from the sibling `context` hook rather than observed firing, and the
+//     README says so.
+//
+// Session identity comes from `data.sessionID`; the `location` key on the
+// envelope is process-level, not per session.
+// ═══════════════════════════════════════════════════════════════════════════
+
 async function v2Setup(ctx: any) {
   const location = ctx.location;
   defaultProjectCwd = location?.directory ?? location?.project?.directory ?? process.cwd();
@@ -800,41 +834,60 @@ async function v2Setup(ctx: any) {
     await observe(sessionId, hookType, data);
   }
 
-  // ── config snapshot ───────────────────────────────────────────────────────
-  // V1's `config` hook observed the global config on every load. V2 has no
-  // equivalent, so this is a one-shot snapshot at setup. Config edited while
-  // OpenCode is running is NOT captured.
+  // Shell ids mapped to their session, so `shell.exited` (which carries no
+  // sessionID) can attribute an exit code back to the right session.
+  const shellSessions = new Map<string, string>();
+  // Tool name per call ID: V2 puts it on the *input* events, not the call.
+  const toolNames = new Map<string, string>();
+  const toolCallInputs = new Map<string, Record<string, unknown>>();
+  // `session:callId` pairs already reported by `execute.after`, so the
+  // `session.tool.failed` event stays a fallback rather than a duplicate.
+  const reportedToolCalls = new Set<string>();
 
-  void (async () => {
-    try {
-      const [agents, providers, mcp] = await Promise.all([
-        ctx.agent?.list?.().catch(() => []),
-        ctx.provider?.list?.().catch(() => []),
-        ctx.mcp?.list?.().catch(() => []),
-      ]);
-      const names = (v: unknown): string[] =>
-        Array.isArray(v)
-          ? v.map((x: any) => (typeof x === "string" ? x : x?.id ?? x?.name)).filter(Boolean)
-          : Object.keys((v as object) ?? {});
-      const payload = {
-        agents: names(agents),
-        providers: names(providers),
-        mcp_servers: names(mcp),
-        model: ctx.model?.default?.() ?? null,
-        location: defaultProjectCwd,
-      };
-      // `setup` runs before any session.created, so `activeSessionId` is
-      // normally null here. Park the payload and let the session.created
-      // handler flush it, the same way V1's `config` hook does.
-      if (activeSessionId) await observeV2(activeSessionId, "config_loaded", payload);
-      else pendingConfig = payload;
-    } catch (e) {
-      if (DEBUG) console.error("[agentmemory] config snapshot failed:", (e as Error).message);
-    }
-  })();
+  // `list()` resolves to `{ data, location }`. Older/alternate shapes return the
+  // array directly, so both are accepted rather than assuming either.
+  function namesFrom(result: unknown): string[] {
+    const arr = Array.isArray(result) ? result : (result as any)?.data;
+    if (!Array.isArray(arr)) return [];
+    return arr.map((x: any) => (typeof x === "string" ? x : x?.id ?? x?.name)).filter(Boolean);
+  }
+
+  // ── config snapshot ───────────────────────────────────────────────────────
+  // V1's `config` hook read the global config on every load. V2 has no
+  // equivalent, so the snapshot is taken at setup and refreshed when the
+  // relevant `*.updated` events arrive, since editing config while OpenCode is
+  // running is otherwise never observed.
+
+  async function snapshotConfig(): Promise<void> {
+    const [agents, providers, mcp, modelDefault] = await Promise.all([
+      ctx.agent?.list?.().catch(() => null),
+      ctx.provider?.list?.().catch(() => null),
+      ctx.mcp?.list?.().catch(() => null),
+      // Must be awaited: the unresolved promise stringifies to `{}`.
+      Promise.resolve(ctx.model?.default?.()).catch(() => null),
+    ]);
+    const model = Array.isArray(modelDefault) ? modelDefault[0] : (modelDefault as any)?.data;
+    const payload = {
+      agents: namesFrom(agents),
+      providers: namesFrom(providers),
+      mcp_servers: namesFrom(mcp),
+      model: model ? `${model.providerID ?? ""}/${model.id ?? model.modelID ?? ""}` : null,
+      model_limits: model?.limit ?? null,
+      location: defaultProjectCwd,
+    };
+    // `setup` runs before any session exists, so the payload is parked and
+    // flushed by whichever session registers first.
+    if (activeSessionId) await observeV2(activeSessionId, "config_loaded", payload);
+    else pendingConfig = payload;
+  }
+
+  void snapshotConfig().catch((e) => {
+    if (DEBUG) console.error("[agentmemory] config snapshot failed:", (e as Error).message);
+  });
 
   // ── tool.execute.before -> ctx.tool.hook("execute.before") ────────────────
-  // V1 read `output.args`; V2 exposes the same values as `event.input`.
+  // Tracks file paths from read/write/edit/glob/grep so the context hook can
+  // ask agentmemory for history about the files about to be touched.
 
   await ctx.tool.hook("execute.before", (event: any) => {
     if (!FILE_TOOLS.has(String(event?.tool ?? "").toLowerCase())) return;
@@ -847,12 +900,69 @@ async function v2Setup(ctx: any) {
     if (stash.size > MAX_STASHED_FILES) {
       const keep = [...stash].slice(-MAX_STASHED_FILES);
       stash.clear();
-      for (const f of keep) stash.add(f);
+      for (const k of keep) stash.add(k);
     }
   });
 
+  // ── tool results -> ctx.tool.hook("execute.after") ────────────────────────
+  // Replaces the V1 `message.part.updated` tool branch. This is the faithful
+  // equivalent: it carries `status`, the tool name, the input and the result,
+  // so post_tool_use and post_tool_failure come from a single hook instead of
+  // being reconstructed from part events that V2 no longer emits.
+
+  await ctx.tool.hook("execute.after", async (event: any) => {
+    const sid = event?.sessionID || activeSessionId;
+    if (!sid) return;
+    const tool = String(event?.tool ?? "");
+    const callId = (event?.id as string) || (event?.messageID as string) || null;
+    const status = String(event?.status ?? "");
+    const result = event?.result ?? {};
+    const metadata = (result?.metadata ?? {}) as Record<string, unknown>;
+    const output = result?.output as Record<string, unknown> | undefined;
+    const raw = output?.output ?? result?.content;
+    const text = Array.isArray(raw)
+      ? raw.map((p: any) => (typeof p === "string" ? p : (p?.text ?? ""))).join("\n")
+      : typeof raw === "string"
+        ? raw
+        : "";
+    const startMs = typeof metadata?.started === "number" ? metadata.started : null;
+    const endMs = typeof metadata?.ended === "number" ? metadata.ended : null;
+    const duration = startMs != null && endMs != null ? endMs - startMs : null;
+
+    if (status === "error") {
+      await observeV2(sid, "post_tool_failure", {
+        tool_name: tool,
+        call_id: callId,
+        tool_input: safeSlice(event?.input, 4000),
+        tool_output: safeSlice(text || extractErrorMessage(metadata?.error), 8000),
+        duration_ms: duration,
+      });
+      // Mark the call as covered so the `session.tool.failed` event does not
+      // report the same failure a second time.
+      if (callId) reportedToolCalls.add(`${sid}:${callId}`);
+      // Mark the call as covered so `session.tool.failed`, which fires for the
+      // same call, does not report the failure a second time.
+      if (callId) reportedToolCalls.add(`${sid}:${callId}`);
+      return;
+    }
+
+    await observeV2(sid, "post_tool_use", {
+      tool_name: tool,
+      call_id: callId,
+      tool_input: safeSlice(event?.input, 4000),
+      tool_output: safeSlice(text, 8000),
+      title: (output?.title as string) ?? null,
+      metadata: metadata,
+      duration_ms: duration,
+      attachments: Array.isArray(output?.attachments)
+        ? (output?.attachments as Array<Record<string, unknown>>).map((a) => a.filename || a.url)
+        : [],
+    });
+    if (callId) reportedToolCalls.add(`${sid}:${callId}`);
+  if (callId) reportedToolCalls.add(`${sid}:${callId}`);
+  });
+
   // ── chat.message -> ctx.session.hook("prompt") ───────────────────────────
-  // V2 runs this once during admission, before attachment resolution.
 
   await ctx.session.hook("prompt", async (event: any) => {
     const sid = event?.sessionID || activeSessionId;
@@ -876,392 +986,409 @@ async function v2Setup(ctx: any) {
     });
   });
 
-  // ── experimental.chat.system.transform -> ctx.session.hook("context") ─────
-  // `output.system` (string[]) became `event.system` (SystemPart[]), so every
-  // push is now a part object. Injects the tool instructions plus recalled
-  // memory once per session, then per-file history for stashed files.
+  // ── memory injection -> ctx.session.hook("context") ───────────────────────
+  // Fires on every model call, so recalled memory is injected on every call.
+  // The previous version injected once per session, which meant the first
+  // prompt carried memory and every later one did not. `system` is
+  // `SystemPart[]`, so every push is a part object.
 
   await ctx.session.hook("context", async (event: any) => {
     const sid = event?.sessionID || activeSessionId;
     if (!sid) return;
+    if (!Array.isArray(event.system)) return;
 
+    // Tool instructions once per session: they are static, unlike memory.
     if (!contextInjectedSessions.has(sid)) {
-      if (!Array.isArray(event.system)) return;
       event.system.push({ type: "text", text: AGENTMEMORY_INSTRUCTIONS });
-      // Prefer the context already fetched at session.created; fall back to a
-      // fresh /context call if the cache missed (e.g. session resumed across a
-      // plugin reload).
-      let ctxText = startContextCache.get(sid);
-      if (typeof ctxText !== "string" || ctxText.length === 0) {
-        const result = await postJson("/context", { sessionId: sid, project: projectFor(sid).name });
-        ctxText = (result as any)?.context;
-      } else {
-        startContextCache.delete(sid);
-      }
-      if (typeof ctxText === "string" && ctxText.length > 0) {
-        event.system.push({ type: "text", text: ctxText });
-      }
       contextInjectedSessions.add(sid);
     }
 
+    // Recalled memory on every call. Prefer what /session/start already
+    // returned for the first call of a session, then fall back to /context.
+    let ctxText = startContextCache.get(sid);
+    if (typeof ctxText !== "string" || ctxText.length === 0) {
+      const result = await postJson("/context", { sessionId: sid, project: projectFor(sid).name });
+      ctxText = (result as any)?.context;
+    } else {
+      startContextCache.delete(sid);
+    }
+    if (typeof ctxText === "string" && ctxText.length > 0) {
+      event.system.push({ type: "text", text: ctxText });
+    }
+
+    // Per-file history for files about to be touched. Consumed on success so
+    // the same file is not enriched twice.
     const stash = stashFor(sid);
     if (stash.size === 0) return;
     const files = [...stash].slice(0, 10);
-
     const enrichResult = await postJson("/enrich", { sessionId: sid, files, toolName: "enrich_inject" });
     const enrichCtx = (enrichResult as any)?.context;
     if (typeof enrichCtx === "string" && enrichCtx.length > 0) {
-      if (Array.isArray(event.system)) event.system.push({ type: "text", text: enrichCtx });
+      event.system.push({ type: "text", text: enrichCtx });
       for (const f of files) stash.delete(f);
     }
   });
 
+  // ── memory during compaction -> ctx.session.hook("compaction") ────────────
+  // The compaction hook exposes `system`, so recalled memory can be pushed
+  // into the compaction prompt, which is what V1's
+  // `experimental.session.compacting` did. INFERRED: the handler was accepted
+  // but was not observed firing during development, so this is written against
+  // the sibling `context` shape rather than a captured one.
+
+  try {
+    await ctx.session.hook("compaction", async (event: any) => {
+      const sid = event?.sessionID || activeSessionId;
+      if (!sid) return;
+      if (!Array.isArray(event?.system)) return;
+      const result = await postJson("/context", { sessionId: sid, project: projectFor(sid).name });
+      const ctxText = (result as any)?.context;
+      if (typeof ctxText === "string" && ctxText.length > 0) {
+        event.system.push({ type: "text", text: ctxText });
+      }
+    });
+  } catch (e) {
+    if (DEBUG) console.error("[agentmemory] compaction hook unavailable:", (e as Error).message);
+  }
+
   // ── event -> ctx.event.subscribe() ───────────────────────────────────────
-  // All lifecycle and message activity arrives on the public server event
-  // stream, aborted on unload.
+  // All session activity arrives on the public event stream, aborted on unload.
 
   const controller = new AbortController();
 
-  // The switch below is wrapped in a function so its `return` statements only
-  // skip the current event. Inline in the loop, they would exit the IIFE and
-  // permanently end the subscription. This mirrors V1, where `return` exits
-  // only the current event callback.
+  // The switch body lives in a function so its `return` statements skip only
+  // the current event. Inline in the loop, they would exit the async IIFE and
+  // permanently end the subscription.
   const handleEvent = async (event: any): Promise<void> => {
-    {
-      const type = event.type;
-        const props: any = (event as any).properties || {};
-        const sid0 = props.sessionID || (props.info?.id as string) || activeSessionId;
+    const type = String(event?.type ?? "");
+    // V2 puts the payload in `data`, not `properties`.
+    const data: any = event?.data ?? {};
+    const sid0 = (data.sessionID as string) || activeSessionId;
 
-        switch (type) {
-          case "session.created": {
-            const info = props.info as any;
-            // Snapshot locally: `activeSessionId` is mutable and another
-            // session.created during the await could rebind it.
-            const sessionId = (info?.id as string) || props.sessionID;
-            if (!sessionId) return;
-            activeSessionId = sessionId;
-            stashedFiles.set(sessionId, new Set());
-            seenSubtaskIds.delete(sessionId);
-            seenToolCallIds.delete(sessionId);
-            contextInjectedSessions.delete(sessionId);
-            const sessionDir = typeof info?.directory === "string" && info.directory ? info.directory : null;
-            if (sessionDir) {
-              sessionProjects.set(sessionId, { cwd: sessionDir, name: resolveProjectName(sessionDir) });
-            }
-            const proj = projectFor(sessionId);
-            const startResult = await postJson("/session/start", {
-              sessionId,
-              title: info?.title ?? null,
-              parentID: info?.parentID ?? null,
-              version: info?.version ?? null,
-              project: proj.name,
-              cwd: proj.cwd,
-            });
-            const startCtx = (startResult as any)?.context;
-            if (typeof startCtx === "string" && startCtx.length > 0) startContextCache.set(sessionId, startCtx);
-            // Flush the setup-time config snapshot parked before any session
-            // existed. Sent after /session/start so the session is registered.
-            if (pendingConfig) {
-              await observeV2(sessionId, "config_loaded", pendingConfig);
-              pendingConfig = null;
-            }
-            break;
-          }
+    // A session that appears on any event is registered once, so
+    // /session/start, the config flush and per-session state all happen.
+    if (sid0 && !activeSessionId) {
+      activeSessionId = sid0;
+      stashedFiles.set(sid0, new Set());
+      seenSubtaskIds.delete(sid0);
+      seenToolCallIds.delete(sid0);
+      contextInjectedSessions.delete(sid0);
+      const dir = (data.location?.directory as string) || (event?.location?.directory as string) || null;
+      if (dir) {
+        sessionProjects.set(sid0, { cwd: dir, name: resolveProjectName(dir) });
+      }
+      const proj = projectFor(sid0);
+      const startResult = await postJson("/session/start", {
+        sessionId: sid0,
+        title: (data.title as string) ?? null,
+        parentID: (data.parentID as string) ?? null,
+        project: proj.name,
+        cwd: proj.cwd,
+      });
+      const startCtx = (startResult as any)?.context;
+      if (typeof startCtx === "string" && startCtx.length > 0) startContextCache.set(sid0, startCtx);
+      // V2 has no `session.created` event and `session.execution.started` was
+      // not observed on the live stream, so the session is registered by the
+      // first event that carries its ID and `session_started` is emitted here
+      // rather than waiting for an event that may never arrive.
+      await observeV2(sid0, "session_started", {});
+      if (pendingConfig) {
+        await observeV2(sid0, "config_loaded", pendingConfig);
+        pendingConfig = null;
+      }
+    }
 
-          case "session.status": {
-            const status = props.status;
-            if (!sid0 || !status) return;
-            if (status.type === "idle") await post("/summarize", { sessionId: sid0 });
-            await observeV2(sid0, "session_status", {
-              status_type: status.type,
-              attempt: status.attempt ?? null,
-              message: safeSlice(status.message, 2000),
-            });
-            break;
-          }
+    switch (type) {
+      // The V1 event names below no longer exist on the V2 stream. They are
+      // listed in README.md with the V2 name each one maps to, so the gaps are
+      // documented rather than silently approximated.
+      //
+      //   session.created   -> registration above (first event carrying the ID)
+      //   session.deleted   -> handled, below
+      //   session.status    -> session.step.started / session.step.ended
+      //   session.idle      -> session.step.ended with finish
+      //   message.updated   -> session.text.*, session.reasoning.*
+      //   message.part.updated -> ctx.tool.hook("execute.after")
+      //   todo.updated      -> no V2 equivalent observed
+      //   file.edited       -> file.watcher.updated, handled below
+      //   command.executed  -> shell.created, handled below
+      //   session.compacted -> ctx.session.hook("compaction")
+      //   session.diff      -> no V2 equivalent observed
+      //   session.error     -> session.execution.failed, handled below
 
-          case "session.idle": {
-            // Summarize is driven by session.status; nothing extra here.
-            break;
-          }
+      case "session.execution.failed": {
+        if (!sid0) return;
+        await observeV2(sid0, "post_tool_failure", {
+          tool_name: "session.execution",
+          tool_input: "",
+          tool_output: safeSlice(extractErrorMessage(data.error ?? data), 8000),
+        });
+        return;
+      }
 
-          case "session.compacted": {
-            if (sid0) {
-              await post("/summarize", { sessionId: sid0 });
-              await observeV2(sid0, "session_compacted", {});
-            }
-            break;
-          }
+      case "session.step.started": {
+        if (!sid0) return;
+        await observeV2(sid0, "step_start", {
+          messageID: (data.assistantMessageID as string) ?? null,
+          agent: (data.agent as string) ?? null,
+          model: data.model ? `${data.model.providerID ?? ""}/${data.model.id ?? ""}` : null,
+        });
+        return;
+      }
 
-          case "session.updated": {
-            const info = props.info as any;
-            if (!sid0) return;
-            await observeV2(sid0, "session_updated", {
-              title: info?.title ?? null,
-              parentID: info?.parentID ?? null,
-              additions: info?.summary?.additions ?? null,
-              deletions: info?.summary?.deletions ?? null,
-              files: info?.summary?.files ?? null,
-            });
-            break;
-          }
+      case "session.step.ended": {
+        if (!sid0) return;
+        const tokens = (data.tokens ?? {}) as Record<string, any>;
+        await observeV2(sid0, "step_finish", {
+          messageID: (data.assistantMessageID as string) ?? null,
+          reason: (data.rawFinish as string) ?? (data.finish as string) ?? null,
+          cost: data.cost ?? 0,
+          input_tokens: tokens.input ?? 0,
+          output_tokens: tokens.output ?? 0,
+          reasoning_tokens: tokens.reasoning ?? 0,
+          cache_read: tokens.cache?.read ?? 0,
+          cache_write: tokens.cache?.write ?? 0,
+        });
+        return;
+      }
 
-          case "session.diff": {
-            if (!sid0 || !Array.isArray(props.diff)) return;
-            const diffs = props.diff as Array<Record<string, any>>;
-            await observeV2(sid0, "session_diff", {
-              files: diffs.map((d) => d.file),
-              additions: diffs.reduce((s, d) => s + (d.additions || 0), 0),
-              deletions: diffs.reduce((s, d) => s + (d.deletions || 0), 0),
-              diffs: diffs.slice(0, 50),
-            });
-            break;
-          }
+      case "session.usage.updated": {
+        if (!sid0) return;
+        const tokens = (data.tokens ?? {}) as Record<string, any>;
+        await observeV2(sid0, "assistant_message", {
+          messageID: null,
+          modelID: null,
+          providerID: null,
+          cost: data.cost ?? 0,
+          tokens: {
+            input: tokens.input ?? 0,
+            output: tokens.output ?? 0,
+            reasoning: tokens.reasoning ?? 0,
+            cache_read: tokens.cache?.read ?? 0,
+            cache_write: tokens.cache?.write ?? 0,
+          },
+          finish: null,
+          error: null,
+          duration_ms: null,
+        });
+        return;
+      }
 
-          case "session.deleted": {
-            const sid = (props.info?.id as string) || props.sessionID || activeSessionId;
-            if (!sid) {
-              if (DEBUG) console.error("[agentmemory] session.deleted with no session ID");
-              return;
-            }
-            await post("/session/end", { sessionId: sid });
-            // Background consolidation: deliberately not awaited.
-            void post("/crystals/auto", { olderThanDays: 7 }, 30000);
-            void post("/consolidate-pipeline", { tier: "all", force: true }, 30000);
-            if (sid === activeSessionId) activeSessionId = null;
-            pruneSessionMaps(sid);
-            startContextCache.delete(sid);
-            contextInjectedSessions.delete(sid);
-            break;
-          }
+      case "session.agent.selected": {
+        if (!sid0) return;
+        await observeV2(sid0, "agent_selected", {
+          name: (data.agent as string) ?? null,
+          previous: (data.previous as string) ?? null,
+        });
+        return;
+      }
 
-          case "session.error": {
-            if (sid0) {
-              await observeV2(sid0, "post_tool_failure", {
-                tool_name: "session.error",
-                tool_input: "",
-                tool_output: extractErrorMessage(props.error).slice(0, 8000),
-              });
-            }
-            break;
-          }
+      case "session.text.started": {
+        if (!sid0) return;
+        await observeV2(sid0, "text_started", { messageID: (data.assistantMessageID as string) ?? null });
+        return;
+      }
 
-          case "message.updated": {
-            const info = props.info as any;
-            if (!info || info.role !== "assistant") return;
-            if (!sid0) return;
-            const tokens = info.tokens;
-            await observeV2(sid0, "assistant_message", {
-              messageID: info.id,
-              parentID: info.parentID,
-              modelID: info.modelID,
-              providerID: info.providerID,
-              mode: info.mode,
-              agent: info.agent ?? null,
-              cost: info.cost ?? 0,
-              tokens: {
-                input: tokens?.input ?? 0,
-                output: tokens?.output ?? 0,
-                reasoning: tokens?.reasoning ?? 0,
-                cache_read: tokens?.cache?.read ?? 0,
-                cache_write: tokens?.cache?.write ?? 0,
-              },
-              finish: info.finish ?? null,
-              error: info.error ? extractErrorMessage(info.error) : null,
-              duration_ms:
-                typeof info.time?.completed === "number" ? info.time.completed - (info.time?.created || 0) : null,
-            });
-            break;
-          }
+      case "session.text.ended": {
+        if (!sid0) return;
+        await observeV2(sid0, "text_ended", { messageID: (data.assistantMessageID as string) ?? null });
+        return;
+      }
 
-          case "message.removed": {
-            if (sid0) await observeV2(sid0, "message_removed", { messageID: props.messageID });
-            break;
-          }
+      case "session.reasoning.started":
+      case "session.reasoning.ended": {
+        if (!sid0) return;
+        await observeV2(sid0, "reasoning", {
+          messageID: (data.assistantMessageID as string) ?? null,
+          text: safeSlice(data.text, 4000),
+        });
+        return;
+      }
 
-          case "message.part.updated": {
-            const part = props.part as any;
-            if (!part) return;
-            const sid = part.sessionID || sid0;
-            if (!sid) return;
+      case "session.instructions.updated": {
+        if (!sid0) return;
+        await observeV2(sid0, "notification", {
+          notification_type: "instructions_updated",
+          text: safeSlice(data.text, 4000),
+        });
+        return;
+      }
 
-            switch (part.type) {
-              case "subtask": {
-                const subtaskId = part.id;
-                if (!subtaskId) return;
-                const set = subtaskSetFor(sid);
-                if (set.has(subtaskId)) return;
-                set.add(subtaskId);
-                await observeV2(sid, "subagent_start", {
-                  subtask_id: part.id,
-                  agent: part.agent,
-                  prompt: safeSlice(part.prompt, 4000),
-                  description: safeSlice(part.description, 2000),
-                });
-                return;
-              }
+      case "session.inbox.delivered": {
+        if (!sid0) return;
+        await observeV2(sid0, "prompt_delivered", { inboxID: (data.inboxID as string) ?? null });
+        return;
+      }
 
-              case "tool": {
-                const state = part.state;
-                if (!state) return;
-                const callId = part.callID;
-                if (!callId) return;
-                const start = typeof state.time?.start === "number" ? state.time.start : null;
-                const end = typeof state.time?.end === "number" ? state.time.end : null;
-                const duration = start != null && end != null ? end - start : null;
+      case "shell.created": {
+        const info = (data.info ?? {}) as Record<string, any>;
+        const shellSid = (info.metadata?.sessionID as string) || sid0;
+        if (!shellSid) return;
+        if (info.id) shellSessions.set(String(info.id), shellSid);
+        await observeV2(shellSid, "command_executed", {
+          name: (info.shell as string) ?? null,
+          arguments: safeSlice(info.command, 2000),
+          cwd: (info.cwd as string) ?? null,
+        });
+        return;
+      }
 
-                // Dedup on terminal states only, matching V1. Marking the ID on
-                // the first pending/running update would make the completed
-                // update look like a duplicate and drop the observation.
-                if (state.status === "completed") {
-                  const set = toolCallSetFor(sid);
-                  if (set.has(callId)) return;
-                  set.add(callId);
-                  await observeV2(sid, "post_tool_use", {
-                    tool_name: part.tool,
-                    call_id: callId,
-                    tool_input: safeSlice(state.input, 4000),
-                    tool_output: safeSlice(state.output, 8000),
-                    title: state.title ?? null,
-                    metadata: state.metadata || {},
-                    duration_ms: duration,
-                    attachments: Array.isArray(state.attachments)
-                      ? state.attachments.map((a: any) => a.filename || a.url)
-                      : [],
-                  });
-                } else if (state.status === "error") {
-                  const set = toolCallSetFor(sid);
-                  if (set.has(callId)) return;
-                  set.add(callId);
-                  await observeV2(sid, "post_tool_failure", {
-                    tool_name: part.tool,
-                    call_id: callId,
-                    tool_input: safeSlice(state.input, 4000),
-                    tool_output: safeSlice(state.error, 8000),
-                    duration_ms: duration,
-                  });
-                }
-                return;
-              }
+      // `shell.exited` carries `{ id, exit, status }` with no sessionID, so the
+      // session is recovered from the id recorded at `shell.created`. A non-zero
+      // exit is a real tool failure and is reported as one.
+      case "shell.exited": {
+        const shellId = String(data.id ?? "");
+        const shellSid = shellSessions.get(shellId) || activeSessionId;
+        if (!shellSid) return;
+        const exit = Number(data.exit ?? 0);
+        if (exit !== 0) {
+          await observeV2(shellSid, "post_tool_failure", {
+            tool_name: "shell",
+            call_id: shellId,
+            tool_input: null,
+            tool_output: safeSlice(data.status, 4000),
+            duration_ms: null,
+          });
+        }
+        return;
+      }
 
-              case "step-finish": {
-                await observeV2(sid, "step_finish", {
-                  messageID: part.messageID,
-                  reason: part.reason ?? null,
-                  cost: part.cost ?? 0,
-                  input_tokens: part.tokens?.input ?? 0,
-                  output_tokens: part.tokens?.output ?? 0,
-                  reasoning_tokens: part.tokens?.reasoning ?? 0,
-                });
-                return;
-              }
+      case "shell.deleted": {
+        const shellId = String(data.id ?? "");
+        shellSessions.delete(shellId);
+        return;
+      }
 
-              case "reasoning": {
-                await observeV2(sid, "reasoning", {
-                  messageID: part.messageID,
-                  text: safeSlice(part.text, 4000),
-                });
-                return;
-              }
+      // Filesystem and VCS activity.
+      case "file.watcher.updated":
+      case "filesystem.changed":
+      case "vcs.branch.updated": {
+        const sid = sid0 || activeSessionId;
+        if (!sid) return;
+        const file = (data.file as string) ?? (data.path as string) ?? null;
+        if (file) stashFor(sid).add(file);
+        return;
+      }
 
-              case "file": {
-                const filename = part.filename || part.url || null;
-                if (filename) stashFor(sid).add(filename);
-                return;
-              }
+      // Tool call lifecycle observed on the live stream:
+      //   session.tool.input.started  { sessionID, assistantMessageID, id, name }
+      //   session.tool.input.ended    { sessionID, assistantMessageID, id, text }
+      //   session.tool.called         { sessionID, assistantMessageID, id, input, executed }
+      //   session.tool.progress       { sessionID, assistantMessageID, id, metadata }
+      //   session.tool.success        { sessionID, assistantMessageID, id, content, metadata, executed }
+      //   session.tool.failed         { sessionID, assistantMessageID, id, error, executed }
+      //
+      // The tool name lives on the *input* events as `name`, not on the call
+      // events, so it is tracked per call ID to label failures correctly.
+      case "session.tool.input.started": {
+        if (!sid0) return;
+        if (data.id) toolNames.set(String(data.id), String(data.name ?? ""));
+        return;
+      }
 
-              case "patch": {
-                await observeV2(sid, "patch_applied", {
-                  messageID: part.messageID,
-                  hash: part.hash,
-                  files: part.files || [],
-                });
-                return;
-              }
-
-              case "compaction": {
-                await observeV2(sid, "compaction_event", {
-                  messageID: part.messageID,
-                  auto: part.auto ?? false,
-                  overflow: part.overflow ?? false,
-                });
-                return;
-              }
-
-              case "agent": {
-                await observeV2(sid, "agent_selected", { messageID: part.messageID, name: part.name });
-                return;
-              }
-
-              case "retry": {
-                await observeV2(sid, "retry_attempt", {
-                  messageID: part.messageID,
-                  attempt: part.attempt,
-                  error: extractErrorMessage(part.error).slice(0, 2000),
-                });
-                return;
-              }
-            }
-            return;
-          }
-
-          case "file.edited": {
-            if (typeof props.file === "string" && props.file.length > 0 && (sid0 || activeSessionId)) {
-              const stash = stashFor(sid0 || activeSessionId!);
-              stash.add(props.file);
-              if (stash.size > MAX_STASHED_FILES) {
-                const keep = [...stash].slice(-MAX_STASHED_FILES);
-                stash.clear();
-                for (const f of keep) stash.add(f);
-              }
-            }
-            break;
-          }
-
-          // V1 listened to "permission.updated"; V2 renamed it to
-          // "permission.asked" and reshaped the payload into PermissionRequest.
-          case "permission.asked": {
-            if (!sid0) return;
-            await observeV2(sid0, "notification", {
-              notification_type: "permission_prompt",
-              permission: props.permission || "unknown",
-              pattern: Array.isArray(props.patterns) ? props.patterns.join(", ") : (props.patterns || ""),
-              tool_call_id: props.tool?.callID || null,
-              title: props.permission || "",
-              metadata: props.metadata || {},
-            });
-            break;
-          }
-
-          case "permission.replied": {
-            if (!sid0) return;
-            await observeV2(sid0, "permission_replied", {
-              permission_id: props.requestID || props.permissionID || "",
-              response: props.reply || props.response || "",
-            });
-            break;
-          }
-
-          case "todo.updated": {
-            const todos = Array.isArray(props.todos) ? props.todos.slice(0, 100) : [];
-            if (!sid0 || todos.length === 0) return;
-            const completed = todos.filter((t: any) => t.status === "completed");
-            const active = todos.filter((t: any) => t.status !== "completed");
-            await observeV2(sid0, "task_completed", {
-              completed: completed.map((t: any) => ({ content: t.content, priority: t.priority })),
-              in_progress: active.map((t: any) => ({ content: t.content, priority: t.priority })),
-              total: todos.length,
-            });
-            break;
-          }
-
-          case "command.executed": {
-            if (sid0) {
-              await observeV2(sid0, "command_executed", { name: props.name, arguments: props.arguments || "" });
-            }
-            break;
+      case "session.tool.input.ended": {
+        if (!sid0) return;
+        // The raw JSON text is the authoritative tool name; it is parsed lazily
+        // by `session.tool.called`, which carries the real input object.
+        if (data.id && typeof data.text === "string" && !toolNames.has(String(data.id))) {
+          try {
+            const parsed = JSON.parse(data.text);
+            if (typeof parsed?.name === "string") toolNames.set(String(data.id), parsed.name);
+          } catch {
+            // Not JSON, or not a tool envelope: the name stays unknown.
           }
         }
+        return;
+      }
+
+      case "session.tool.called": {
+        if (!sid0) return;
+        if (data.id) toolCallInputs.set(String(data.id), (data.input ?? {}) as Record<string, unknown>);
+        return;
+      }
+
+      case "session.tool.progress": {
+        if (!sid0) return;
+        const callId = String(data.id ?? "");
+        if (!callId || !FILE_TOOLS.has((toolNames.get(callId) ?? "").toLowerCase())) return;
+        const input = toolCallInputs.get(callId);
+        if (!input) return;
+        const stash = stashFor(sid0);
+        for (const fp of extractFilePaths(input)) stash.add(fp);
+        return;
+      }
+
+      case "session.tool.failed": {
+        if (!sid0) return;
+        const callId = String(data.id ?? "");
+        // `execute.after` already reported this call with full detail.
+        if (callId && reportedToolCalls.has(`${sid0}:${callId}`)) return;
+        await observeV2(sid0, "post_tool_failure", {
+          tool_name: toolNames.get(callId) || null,
+          call_id: callId || null,
+          tool_input: safeSlice(toolCallInputs.get(callId), 4000),
+          tool_output: safeSlice(extractErrorMessage(data.error), 8000),
+          duration_ms: null,
+        });
+        if (callId) {
+          toolNames.delete(callId);
+          toolCallInputs.delete(callId);
+        }
+        return;
+      }
+
+      // V1 listened to `permission.updated`; V2 renames it to `permission.asked`
+      // and reshapes the payload to a PermissionRequest carrying `action` and
+      // `resources`. Not observed firing during development, so both the V2
+      // field names and the V1 fallbacks are read.
+      case "permission.asked": {
+        if (!sid0) return;
+        const resources = (data.resources ?? data.patterns ?? []) as unknown;
+        await observeV2(sid0, "notification", {
+          notification_type: "permission_prompt",
+          permission: (data.action as string) ?? (data.permission as string) ?? "unknown",
+          pattern: Array.isArray(resources) ? resources.join(", ") : String(resources ?? ""),
+          tool_call_id: (data.tool?.callID as string) ?? (data.callID as string) ?? null,
+          title: (data.action as string) ?? (data.permission as string) ?? "",
+          metadata: data.metadata ?? {},
+        });
+        return;
+      }
+
+      case "permission.replied": {
+        if (!sid0) return;
+        await observeV2(sid0, "permission_replied", {
+          permission_id: (data.requestID as string) ?? (data.permissionID as string) ?? "",
+          response: (data.reply as string) ?? (data.response as string) ?? "",
+        });
+        return;
+      }
+
+      case "session.deleted": {
+        const sid = (data.sessionID as string) || activeSessionId;
+        if (!sid) return;
+        await post("/session/end", { sessionId: sid });
+        // Background consolidation: deliberately not awaited.
+        void post("/crystals/auto", { olderThanDays: 7 }, 30000);
+        void post("/consolidate-pipeline", { tier: "all", force: true }, 30000);
+        if (sid === activeSessionId) activeSessionId = null;
+        pruneSessionMaps(sid);
+        startContextCache.delete(sid);
+        contextInjectedSessions.delete(sid);
+        return;
+      }
+
+      // Config and content changes re-take the snapshot instead of leaving the
+      // one-shot reading from `setup` permanently stale.
+      case "config.updated":
+      case "agent.updated":
+      case "provider.updated":
+      case "model.updated":
+      case "mcp.status.changed": {
+        if (DEBUG) console.error("[agentmemory] config changed, re-snapshotting");
+        void snapshotConfig().catch(() => {});
+        return;
+      }
     }
   };
 
