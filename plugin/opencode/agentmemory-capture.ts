@@ -815,9 +815,16 @@ const v1Hooks: Plugin = async (ctx) => {
 //   * `ctx.session.hook("context")` fires on every model call and exposes
 //     `system` as `SystemPart[]`, so memory is injected on every call rather
 //     than once per session.
-//   * `ctx.session.hook("compaction")` accepts a handler. Its shape is inferred
-//     from the sibling `context` hook rather than observed firing, and the
-//     README says so.
+//   * `session.created` exists and carries `sessionID`, `projectID`,
+//     `location`, `title`, `version`, `subpath` and `slug`. An earlier revision
+//     of this file claimed it did not exist: that came from observing a
+//     session that was already open and never creating one.
+//   * `ctx.session.hook("compaction")` registers a handler that is never
+//     invoked, even when `ctx.session.compact()` is called and returns a
+//     compaction message. Compaction is captured from
+//     `session.compaction.started` and `session.compaction.failed` instead.
+//   * `parentID` is accepted by `ctx.session.create` but appears in no event
+//     payload, so the `parentID` sent to `/session/start` is always null.
 //
 // Session identity comes from `data.sessionID`; the `location` key on the
 // envelope is process-level, not per session.
@@ -1040,27 +1047,19 @@ async function v2Setup(ctx: any) {
     }
   });
 
-  // ── memory during compaction -> ctx.session.hook("compaction") ────────────
-  // The compaction hook exposes `system`, so recalled memory can be pushed
-  // into the compaction prompt, which is what V1's
-  // `experimental.session.compacting` did. INFERRED: the handler was accepted
-  // but was not observed firing during development, so this is written against
-  // the sibling `context` shape rather than a captured one.
-
-  try {
-    await ctx.session.hook("compaction", async (event: any) => {
-      const sid = event?.sessionID || activeSessionId;
-      if (!sid) return;
-      if (!Array.isArray(event?.system)) return;
-      const result = await postJson("/context", { sessionId: sid, project: projectFor(sid).name });
-      const ctxText = (result as any)?.context;
-      if (typeof ctxText === "string" && ctxText.length > 0) {
-        event.system.push({ type: "text", text: ctxText });
-      }
-    });
-  } catch (e) {
-    if (DEBUG) console.error("[agentmemory] compaction hook unavailable:", (e as Error).message);
-  }
+  // ── compaction ────────────────────────────────────────────────────────────
+  // Removed: `ctx.session.hook("compaction")`.
+  //
+  // It registers without error and the callback is never invoked, even when
+  // `ctx.session.compact()` is called directly and returns a compaction
+  // message. The loader validates hook names at registration but not against
+  // invocation, so a registered hook is not evidence that it fires.
+  //
+  // Compaction is therefore captured from `session.compaction.started` and
+  // `session.compaction.failed` in the event switch below. The consequence is
+  // that memory can no longer be attached to the compaction prompt, which is
+  // recorded as a limitation rather than approximated: no compaction event
+  // carries a `system` array to inject into.
 
   // ── event -> ctx.event.subscribe() ───────────────────────────────────────
   // All session activity arrives on the public event stream, aborted on unload.
@@ -1079,6 +1078,12 @@ async function v2Setup(ctx: any) {
 
     // A session that appears on any event is registered once, so /session/start,
     // the config flush and per-session state all happen.
+    //
+    // `session.created` exists on the V2 stream and carries `sessionID`, so a
+    // session normally registers on creation, with `title` and `location`
+    // available at that moment. The fallback to "first event carrying an ID"
+    // is still needed for sessions that predate the plugin load, which never
+    // emit `session.created`.
     //
     // Registration is tracked per session ID rather than gated on
     // `activeSessionId` being unset. Gating on the global meant the first
@@ -1125,10 +1130,11 @@ async function v2Setup(ctx: any) {
 
       const startCtx = (startResult as any)?.context;
       if (typeof startCtx === "string" && startCtx.length > 0) startContextCache.set(sid0, startCtx);
-      // V2 has no `session.created` event and `session.execution.started` was
-      // not observed on the live stream, so the session is registered by the
-      // first event that carries its ID and `session_started` is emitted here
-      // rather than waiting for an event that may never arrive.
+      // `session_started` is emitted at registration rather than from an event
+      // of its own: `session.created` has no dedicated V1 counterpart to map
+      // to, and emitting it here keeps `/session/start` and the first
+      // observation in order for every session, including those that only
+      // reach us through the fallback path.
       await observeV2(sid0, "session_started", {});
       if (pendingConfig) {
         await observeV2(sid0, "config_loaded", pendingConfig);
@@ -1141,7 +1147,7 @@ async function v2Setup(ctx: any) {
       // listed in README.md with the V2 name each one maps to, so the gaps are
       // documented rather than silently approximated.
       //
-      //   session.created   -> registration above (first event carrying the ID)
+      //   session.created   -> registration above (it carries sessionID)
       //   session.deleted   -> handled, below
       //   session.status    -> session.step.started / session.step.ended
       //   session.idle      -> session.step.ended with finish
@@ -1150,7 +1156,7 @@ async function v2Setup(ctx: any) {
       //   todo.updated      -> no V2 equivalent observed
       //   file.edited       -> file.watcher.updated, handled below
       //   command.executed  -> shell.created, handled below
-      //   session.compacted -> ctx.session.hook("compaction")
+      //   session.compacted -> session.compaction.started / .failed, below
       //   session.diff      -> no V2 equivalent observed
       //   session.error     -> session.execution.failed, handled below
 
@@ -1160,6 +1166,38 @@ async function v2Setup(ctx: any) {
           tool_name: "session.execution",
           tool_input: "",
           tool_output: safeSlice(extractErrorMessage(data.error ?? data), 8000),
+        });
+        return;
+      }
+
+      // `session.execution.succeeded` is observed but deliberately not
+      // recorded: it carries only `{ sessionID }`, which every other
+      // observation in the session already carries, and `session.step.ended`
+      // already covers the meaningful signal. Recording it would add volume,
+      // not information.
+
+      // Compaction is captured from the stream. Neither event carries a
+      // `system` array, so this observes what happened rather than injecting
+      // memory into the prompt, which the dead `compaction` hook could not do
+      // either.
+      case "session.compaction.started": {
+        if (!sid0) return;
+        await observeV2(sid0, "compaction_event", {
+          state: "started",
+          reason: (data.reason as string) ?? null,
+          inputID: (data.inputID as string) ?? null,
+          recent: safeSlice(data.recent, 8000),
+        });
+        return;
+      }
+
+      case "session.compaction.failed": {
+        if (!sid0) return;
+        await observeV2(sid0, "compaction_event", {
+          state: "failed",
+          reason: (data.reason as string) ?? null,
+          inputID: (data.inputID as string) ?? null,
+          tool_output: safeSlice(extractErrorMessage(data.error ?? data.reason), 8000),
         });
         return;
       }
