@@ -227,7 +227,7 @@ these three risks retired with it.
 
 ### Verification
 
-- A 36-assertion suite drives the V2 path with payloads captured from
+- A 35-assertion suite drives the V2 path with payloads captured from
   v2.0.22 and covers every handler, the deduplication paths between
   `execute.after`, `session.tool.failed` and `shell.exited`, and the regression
   where an early `return` ended the event subscription permanently. Zero
