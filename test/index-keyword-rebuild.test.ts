@@ -204,6 +204,35 @@ describe("rebuildKeywordIndex", () => {
     }
   }, 10_000);
 
+  it("flags the rebuild incomplete when the memories listing never succeeds", async () => {
+    vi.useFakeTimers();
+    try {
+      const kv = mockKV();
+      seed(kv, 1, 3, () => "2026-09-01T00:00:00.000Z");
+      let failures = 0;
+      const failingKv = {
+        ...kv,
+        list: async <T>(scope: string): Promise<T[]> => {
+          if (scope === "mem:memories") {
+            failures++;
+            throw new Error("engine unreachable");
+          }
+          return kv.list<T>(scope);
+        },
+      };
+
+      const promise = rebuildKeywordIndex(failingKv as never);
+      await vi.advanceTimersByTimeAsync(120_000);
+      const result = await promise;
+
+      expect(failures).toBe(8);
+      expect(result.documents).toBeGreaterThan(0);
+      expect(isBm25RebuildIncomplete()).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 10_000);
+
   it("queues embeddings only for documents newer than the last vector save", async () => {
     const kv = mockKV();
     seed(kv, 2, 5, (i) => (i < 5 ? "2026-09-01T00:00:00.000Z" : "2026-09-20T00:00:00.000Z"));

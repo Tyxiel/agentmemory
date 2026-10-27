@@ -599,7 +599,9 @@ async function runKeywordRebuild(
   let documents = 0
   let memoriesLoaded = false
   const memories = await listWithRetry<Memory>(kv, KV.memories, 'rebuildKeywordIndex: memories')
-  if (memories !== null) {
+  if (memories === null) {
+    bm25RebuildIncomplete = true
+  } else {
     memoriesLoaded = true
     for (const memory of memories) {
       if (memory.isLatest === false) continue
