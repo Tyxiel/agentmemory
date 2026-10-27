@@ -57,6 +57,25 @@ describe("Worker Compose project", () => {
     expect(shellQuote("100%", true)).toBe('"100%%"');
   });
 
+  it("emits worker sources and commands the engine can resolve on Windows", () => {
+    const text = renderWorkerCompose(
+      options({
+        windows: true,
+        projectRoot: "C:\\Users\\someone\\pkg",
+        nodeBin: "C:\\agentmemory-runtime\\node.exe",
+        dataDir: "C:\\Users\\someone\\data",
+        homeDir: "C:\\Users\\someone",
+        workerBinDir: "C:\\am\\workers",
+        workerBinDirIsAbsolute: true,
+      }),
+    );
+    const parsed = parse(text) as { containers: Record<string, { worker: string; scripts: { run: string } }> };
+    expect(parsed.containers.agentmemory!.worker).toBe("path:///Users/someone/pkg");
+    expect(parsed.containers.agentmemory!.scripts.run).toBe("C:\\agentmemory-runtime\\node.exe dist/index.mjs");
+    expect(parsed.containers.state!.worker).toBe("path:///Users/someone/data/compose/local-workers/state");
+    expect(text).not.toContain("path://C:");
+  });
+
   it("executes generated commands through sh -c even with spaces and metacharacters", () => {
     const { spawnSync } = require("node:child_process") as typeof import("node:child_process");
     const dir = join(root, "Node Runtime & (stable)");

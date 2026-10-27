@@ -136,6 +136,17 @@ export function shellCommand(program: string, args: string[], windows: boolean):
   return windows ? `"${command}"` : command;
 }
 
+export function pathWorkerSource(directory: string, windows: boolean): string {
+  if (!windows) return `path://${directory}`;
+  return `path:///${directory.replace(/^[A-Za-z]:[\\/]/, "").replaceAll("\\", "/")}`;
+}
+
+export function workerRunScript(program: string, args: string[], windows: boolean): string {
+  const parts = [program, ...args];
+  if (windows && parts.every((part) => !/[\s"]/.test(part))) return parts.join(" ");
+  return shellCommand(program, args, windows);
+}
+
 function yamlString(value: string): string {
   if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) {
     throw new Error("A Compose path or configuration value contains an unsupported control character.");
@@ -234,13 +245,14 @@ export function renderWorkerCompose(options: ComposeProjectOptions): string {
     : null;
   const startupSeconds = Math.ceil((options.startupTimeoutMs ?? 300_000) / 1000);
   const restartEnabled = !options.disableRestartPolicy;
+  const windows = options.windows ?? process.platform === "win32";
   if (!Number.isSafeInteger(startupSeconds) || startupSeconds < 1 || startupSeconds * 1000 > MAX_STARTUP_TIMEOUT_MS + 999) {
     throw new Error("Compose worker startup timeout must be between 1 and 3600000 milliseconds.");
   }
 
   const workerSource = (name: keyof typeof COMPOSE_WORKER_VERSIONS): string =>
     workerBinDir
-      ? `path://${localWorkerProjectDir(paths, name)}`
+      ? pathWorkerSource(localWorkerProjectDir(paths, name), windows)
       : `package://api.workers.iii.dev/${name}`;
   const workerScript = (name: keyof typeof COMPOSE_WORKER_VERSIONS): string =>
     workerBinDir ? join(workerBinDir, name) : "";
@@ -319,13 +331,13 @@ export function renderWorkerCompose(options: ComposeProjectOptions): string {
 
   lines.push(
     "  agentmemory:",
-    `    worker: ${yamlString(`path://${options.projectRoot}`)}`,
+    `    worker: ${yamlString(pathWorkerSource(options.projectRoot, windows))}`,
     "    start_after: [state, http]",
     `    startup_timeout: ${startupSeconds}s`,
     "    config_name: agentmemory",
     ...restartPolicyLines("    ", restartEnabled),
     "    scripts:",
-    `      run: ${yamlString(shellCommand(options.nodeBin, ["dist/index.mjs"], options.windows ?? process.platform === "win32"))}`,
+    `      run: ${yamlString(workerRunScript(options.nodeBin, ["dist/index.mjs"], windows))}`,
   );
   if (filteredEnvFile) lines.push(`    env_file: [${yamlString(filteredEnvFile)}]`);
   const explicitWorkerEnvironment = Object.entries(options.workerEnvironment ?? {})
