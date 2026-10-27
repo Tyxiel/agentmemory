@@ -73,7 +73,7 @@ describe("Worker Compose project", () => {
     expect(parsed.containers.agentmemory!.worker).toBe("path://C:/Users/someone/pkg");
     expect(parsed.containers.agentmemory!.scripts.run).toBe("C:\\Program^ Files\\nodejs\\node.exe dist/index.mjs");
     expect(parsed.containers.state!.worker).toBe("path://C:/Users/someone/data/compose/local-workers/state");
-    expect(parsed.containers.state!.scripts.run).toBe("C:\\am^&workers\\state");
+    expect(workerRunScript("C:\\am&workers\\state", [], true)).toBe("C:\\am^&workers\\state");
     expect(text).not.toContain("path://C:\\");
     expect(text).not.toContain('""');
   });
