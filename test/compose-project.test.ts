@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parse } from "yaml";
 import { composeEnvironment } from "../src/cli/compose-control.js";
-import { COMPOSE_WORKER_VERSIONS, composeNamespace, renderWorkerCompose, shellCommand, shellQuote, writeWorkerCompose } from "../src/cli/compose-project.js";
+import { COMPOSE_WORKER_VERSIONS, composeNamespace, renderWorkerCompose, shellCommand, shellQuote, workerRunScript, writeWorkerCompose } from "../src/cli/compose-project.js";
 
 const root = mkdtempSync(join(tmpdir(), "agentmemory-compose-"));
 const rootUrl = `path://${root.replaceAll("\\", "/")}`;
@@ -76,6 +76,10 @@ describe("Worker Compose project", () => {
     expect(parsed.containers.state!.scripts.run).toBe("C:\\am^&workers\\state");
     expect(text).not.toContain("path://C:\\");
     expect(text).not.toContain('""');
+  });
+
+  it("leaves percent signs alone in Windows worker commands", () => {
+    expect(workerRunScript("C:\\50% off\\node.exe", ["dist/index.mjs"], true)).toBe("C:\\50%^ off\\node.exe dist/index.mjs");
   });
 
   it("executes generated commands through sh -c even with spaces and metacharacters", () => {
