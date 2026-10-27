@@ -78,8 +78,11 @@ describe("Worker Compose project", () => {
     expect(text).not.toContain('""');
   });
 
-  it("leaves percent signs alone in Windows worker commands", () => {
-    expect(workerRunScript("C:\\50% off\\node.exe", ["dist/index.mjs"], true)).toBe("C:\\50%^ off\\node.exe dist/index.mjs");
+  it("escapes percent signs so cmd does not expand them", () => {
+    expect(workerRunScript("C:\\pct%TEMP%\\node.exe", ["dist/index.mjs"], true)).toBe(
+      "C:\\pct^%TEMP^%\\node.exe dist/index.mjs",
+    );
+    expect(workerRunScript("C:\\50% off\\node.exe", [], true)).toBe("C:\\50^%^ off\\node.exe");
   });
 
   it("executes generated commands through sh -c even with spaces and metacharacters", () => {

@@ -142,7 +142,7 @@ export function pathWorkerSource(directory: string, windows: boolean): string {
 }
 
 export function cmdEscape(value: string): string {
-  return value.replace(/[\s&|<>^()!,;=]/g, (char) => `^${char}`);
+  return value.replace(/[\s&|<>^()!%,;=]/g, (char) => `^${char}`);
 }
 
 export function workerRunScript(program: string, args: string[], windows: boolean): string {
