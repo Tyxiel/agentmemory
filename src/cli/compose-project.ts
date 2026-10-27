@@ -138,12 +138,16 @@ export function shellCommand(program: string, args: string[], windows: boolean):
 
 export function pathWorkerSource(directory: string, windows: boolean): string {
   if (!windows) return `path://${directory}`;
-  return `path:///${directory.replace(/^[A-Za-z]:[\\/]/, "").replaceAll("\\", "/")}`;
+  return `path://${directory.replaceAll("\\", "/")}`;
+}
+
+export function cmdEscape(value: string): string {
+  return value.replace(/[\s&|<>^()!%,;=]/g, (char) => `^${char}`);
 }
 
 export function workerRunScript(program: string, args: string[], windows: boolean): string {
   const parts = [program, ...args];
-  if (windows && parts.every((part) => !/[\s"]/.test(part))) return parts.join(" ");
+  if (windows) return parts.map(cmdEscape).join(" ");
   return shellCommand(program, args, windows);
 }
 
@@ -285,7 +289,7 @@ export function renderWorkerCompose(options: ComposeProjectOptions): string {
     ...(!workerBinDir ? [`    version: ${yamlString(COMPOSE_WORKER_VERSIONS.state)}`] : []),
     "    config_name: state",
     ...restartPolicyLines("    ", restartEnabled),
-    ...(workerBinDir ? [`    scripts:`, `      run: ${yamlString(shellCommand(stateScript, [], options.windows ?? process.platform === "win32"))}`] : []),
+    ...(workerBinDir ? [`    scripts:`, `      run: ${yamlString(workerRunScript(stateScript, [], windows))}`] : []),
     "    config_override:",
     "      adapter:",
     "        name: kv",
@@ -315,7 +319,7 @@ export function renderWorkerCompose(options: ComposeProjectOptions): string {
     ...(!workerBinDir ? [`    version: ${yamlString(COMPOSE_WORKER_VERSIONS.http)}`] : []),
     "    config_name: http",
     ...restartPolicyLines("    ", restartEnabled),
-    ...(workerBinDir ? [`    scripts:`, `      run: ${yamlString(shellCommand(httpScript, [], options.windows ?? process.platform === "win32"))}`] : []),
+    ...(workerBinDir ? [`    scripts:`, `      run: ${yamlString(workerRunScript(httpScript, [], windows))}`] : []),
     "    config_override:",
     "      host: 127.0.0.1",
     `      port: ${restPort}`,

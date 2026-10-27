@@ -62,18 +62,20 @@ describe("Worker Compose project", () => {
       options({
         windows: true,
         projectRoot: "C:\\Users\\someone\\pkg",
-        nodeBin: "C:\\agentmemory-runtime\\node.exe",
+        nodeBin: "C:\\Program Files\\nodejs\\node.exe",
         dataDir: "C:\\Users\\someone\\data",
         homeDir: "C:\\Users\\someone",
-        workerBinDir: "C:\\am\\workers",
+        workerBinDir: "C:\\am&workers",
         workerBinDirIsAbsolute: true,
       }),
     );
     const parsed = parse(text) as { containers: Record<string, { worker: string; scripts: { run: string } }> };
-    expect(parsed.containers.agentmemory!.worker).toBe("path:///Users/someone/pkg");
-    expect(parsed.containers.agentmemory!.scripts.run).toBe("C:\\agentmemory-runtime\\node.exe dist/index.mjs");
-    expect(parsed.containers.state!.worker).toBe("path:///Users/someone/data/compose/local-workers/state");
-    expect(text).not.toContain("path://C:");
+    expect(parsed.containers.agentmemory!.worker).toBe("path://C:/Users/someone/pkg");
+    expect(parsed.containers.agentmemory!.scripts.run).toBe("C:\\Program^ Files\\nodejs\\node.exe dist/index.mjs");
+    expect(parsed.containers.state!.worker).toBe("path://C:/Users/someone/data/compose/local-workers/state");
+    expect(parsed.containers.state!.scripts.run).toBe("C:\\am^&workers\\state");
+    expect(text).not.toContain("path://C:\\");
+    expect(text).not.toContain('""');
   });
 
   it("executes generated commands through sh -c even with spaces and metacharacters", () => {
