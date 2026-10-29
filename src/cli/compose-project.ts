@@ -136,11 +136,6 @@ export function shellCommand(program: string, args: string[], windows: boolean):
   return windows ? `"${command}"` : command;
 }
 
-export function pathWorkerSource(directory: string, windows: boolean): string {
-  if (!windows) return `path://${directory}`;
-  return `path://${directory.replaceAll("\\", "/")}`;
-}
-
 export function cmdEscape(value: string): string {
   return value.replace(/[\s&|<>^()!%,;=]/g, (char) => `^${char}`);
 }
@@ -256,7 +251,7 @@ export function renderWorkerCompose(options: ComposeProjectOptions): string {
 
   const workerSource = (name: keyof typeof COMPOSE_WORKER_VERSIONS): string =>
     workerBinDir
-      ? pathWorkerSource(localWorkerProjectDir(paths, name), windows)
+      ? `path://${localWorkerProjectDir(paths, name)}`
       : `package://api.workers.iii.dev/${name}`;
   const workerScript = (name: keyof typeof COMPOSE_WORKER_VERSIONS): string =>
     workerBinDir ? join(workerBinDir, name) : "";
@@ -335,7 +330,7 @@ export function renderWorkerCompose(options: ComposeProjectOptions): string {
 
   lines.push(
     "  agentmemory:",
-    `    worker: ${yamlString(pathWorkerSource(options.projectRoot, windows))}`,
+    `    worker: ${yamlString(`path://${options.projectRoot}`)}`,
     "    start_after: [state, http]",
     `    startup_timeout: ${startupSeconds}s`,
     "    config_name: agentmemory",
